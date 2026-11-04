@@ -956,6 +956,24 @@ static void load_kitskip(void)
     fclose(f);
 }
 static const char *current_level(void);
+#define OFF_SPAWNER_COUNT 0x8c   // (co-op spawners - see coopspawn)
+static char *g_coopSp[8];
+static int g_coopSpN, g_coopNext, g_coopAuto;
+static int g_coopDelayMs = 1000;   // (coopspawn delay <s>: how long a human is without a soldier before the spawn - 1 s, was 10)
+static int coop_find_spawners(void);
+static int coop_spawn_one(char *pl, int quiet);
+static int coop_vehicle_for(char *pl);
+static int coop_human_squad(char *pl);
+static int g_squadN;   // coopsquad (see coop_squad_tick)
+static char g_squadVeh[32], g_squadMark[64], g_squadTrig[32];
+static int g_squadGo;   // (coopsquad go: the drop now, no trigger wait)
+#define ADDR_VEHICLE_SPAWN_VTABLE 0x025cb6d8   // (VehicleSpawnEntity - also defined with coopvehicle)
+static int g_coopMaxViper = 1;   // coopvehicle max <n>: extra helicopters for humans; beyond that they go on foot at the LZ (ground team)
+static char *g_gVeh; static int g_gState, g_hueyBad; static DWORD g_gAt;   // the ground team's parked transport (coop_ground_for)   // (trigger: a mission vehicle of that name near the mark)
+static int g_coopBoard;
+static char g_coopBoardLevels[128];   // coopboard on <LEVEL> [LEVEL...]: only there ("" = every co-op level)
+static int g_coopVehicle;                       // coopvehicle on|off: a just-spawned human whose team-mates' vehicle is full gets his own
+static char *g_coopNewPl[8]; static DWORD g_coopNewAt[8];   // humans coopspawn just spawned (for coopvehicle, up to 2 min)
 static int kit_item_skipped(const char *asset)
 {
     const char *lvl = current_level();
@@ -2686,6 +2704,173 @@ static void find_flags(void)
 }
 static int flag_owner(int f) { return *(int *)(g_flags[f] + OFF_CP_OWNER_TEAM); }
 static float *flag_pos(int f) { return (float *)(g_flags[f] + OFF_CP_POSITION); }
+// ---- co-op objectives (2026-10-29): co-op levels have no capture points, so BotMod's bots (task "objectives") had nowhere to go.
+// Each "obj..." mark of the level in BotMod\coop_marks.txt (coopobjective <name> <player> | <x y z>) becomes a FAKE capture point in
+// BotMod's own memory - only the fields BotMod reads (it never calls game code on a flag): position, owner team 2 (the bots attack it),
+// control team 0, takeable data, a unique owner object - so the bots path there and fight whatever is on the way. Nothing in the game
+// knows about it (no HUD flag, never captured).
+static char g_coopFlag[MAX_FLAGS][0x200], g_coopFlagData[MAX_FLAGS][0x100];
+static float *human_pos(char *pl);
+#define COOP_MAX_OBJ 16
+static char g_coopObjName[COOP_MAX_OBJ][64];
+static float g_coopObjPos[COOP_MAX_OBJ][3];
+static int g_coopObjN, g_coopStage, g_coopRetarget;   // (g_coopRetarget: the bots pick again - done in coop_tick, after BotBrain)
+static int g_stageWaveFor = -1;           // the stage whose enemy wave has been sent (coop_stage_wave_tick)
+static int g_coopBotAI = 1;   // coopbotai 0|1: the AI flag set before the spawn (test: AI-flagged ones stood still at the LZ, 13:18)
+static char g_coopFadeCmd[160]; static DWORD g_coopFadeDue;   // coopfade (see coop_spawn_one)
+static int g_aiStep, g_aiSyncXf = 1; static LONG g_aiStepped, g_aiStepSkip0;   // aistep (see ai_step_tick)
+static int g_aiMove; static volatile LONG g_aiMoveSteered;   // aimove (see ai_move_input)
+static int g_aiBpWanted;   // aiblueprint coop (see ai_blueprint)
+static int g_coopStallSec, g_coopStallRadius = 120; static volatile LONG g_coopStallKills;   // coopstall (see coop_stall_tick)
+static DWORD g_squadDropAt;
+static int g_coopWavesOff;     // coopwaves off: the stage waves are not sent (order research)
+static int g_coopBotType = 1;  // coopbottype <n>: the friendly spawners' PlayerType a squad bot spawns through (1 AI - AISoldier, stands
+                               // frozen: the game's AI moves it; 2 extra - SoldierExtra: test 13:58)
+static int g_coopBotGod;       // coopbotgod on|off: squad bots on a co-op level take no damage (a CoopSoldier's death is "Mission failed - you died")
+static char g_coopBotBp[64];   // coopbotbp <blueprint name part>: the friendly AI spawner's soldier blueprint swapped for this one for a bot's
+                               // spawn (13:29: AISoldier bots stood frozen - their character is the AI's to move, not BotMod's input)   // when this mission's squad drop started (the waves wait for it: the 13:17:21 wave went out at the load)
+static char *g_stageEnemy[64]; static int g_stageEnemyN;   // the AI players of that wave (alive = they have a soldier)
+static void coop_stage_apply(void);
+// "Capture" of a co-op objective (the game knows nothing of it): twice a second, the living soldiers of each team within 20 m (bots,
+// humans, the mission's AI); team 1 alone there for 5 s -> owner / control 1 (the bots now defend it: dig in, as the user wanted at
+// the general's meeting point); team 2 alone for 5 s -> back to 2.
+static void coop_capture_tick(void)
+{
+    static DWORD last, held[MAX_FLAGS][3];
+    if (GetTickCount() - last < 500) return;
+    last = GetTickCount();
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    static int hunting; static DWORD huntAt;
+    for (int f = 0; f < g_flagCount && !hunting; f++) {   // (hunting: the point is ours, it stands on the enemy for the bots to go to)
+        if (g_flags[f] < g_coopFlag[0] || g_flags[f] >= g_coopFlag[MAX_FLAGS - 1] + 0x200) continue;   // (only our fake ones)
+        float *fp = flag_pos(f);
+        int n[3] = {0};
+        for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+            char *o = arr[k];
+            int t = o ? player_team(o) : 0;
+            float *p = (t == 1 || t == 2) && *(void **)(o + OFF_PLAYER_SOLDIER) ? human_pos(o) : NULL;
+            if (p && (p[0] - fp[0]) * (p[0] - fp[0]) + (p[1] - fp[1]) * (p[1] - fp[1]) + (p[2] - fp[2]) * (p[2] - fp[2]) < 20.0f * 20.0f) n[t]++;
+        }
+        int *own = (int *)(g_flags[f] + OFF_CP_OWNER_TEAM), *ctl = (int *)(g_flags[f] + OFF_CP_CONTROL_TEAM);
+        *ctl = n[1] && !n[2] ? 1 : n[2] && !n[1] ? 2 : 0;
+        for (int t = 1; t <= 2; t++) {
+            if (!(n[t] && !n[3 - t]) || *own == t) { held[f][t] = 0; continue; }
+            if (!held[f][t]) held[f][t] = GetTickCount();
+            else if (GetTickCount() - held[f][t] > 5000) {
+                *own = t; held[f][t] = 0;
+                bot_log("coopobjective: objective %d taken by team %d (%d of theirs there)", f, t, n[t]);
+            }
+        }
+    }
+    // The hunt (2026-10-29, the user: "none of the enemy or friendly bots were shooting"): the wave stands on its routes 60-100 m
+    // from the point, behind houses - out of the bots' sight; held, the bots stayed on the point. While the stage's wave lives, the
+    // (held) point is put on its nearest live soldier, enemy-owned - the bots go for it and fight; the wave dead, it goes back, ours.
+    if (g_coopStage < g_coopObjN && g_flagCount && g_flags[0] == g_coopFlag[0]) {
+        int *own = (int *)(g_flags[0] + OFF_CP_OWNER_TEAM);
+        float *op = g_coopObjPos[g_coopStage], *best = NULL, bd = 1e30f;
+        for (int e = 0; e < g_stageEnemyN; e++) {
+            char *o = g_stageEnemy[e];
+            if (!o || IsBadReadPtr(o, 0x400) || !*(void **)(o + OFF_PLAYER_SOLDIER) || player_team(o) != 2) continue;
+            float *p = human_pos(o), dd = (p[0] - op[0]) * (p[0] - op[0]) + (p[2] - op[2]) * (p[2] - op[2]);
+            if (dd < bd) { bd = dd; best = p; }
+        }
+        if (!hunting && *own == 1 && best) { hunting = 1; huntAt = 0; bot_log("coophunt: objective %d held - the bots go for its wave", g_coopStage + 1); }
+        if (hunting && best && GetTickCount() - huntAt > 4000) {
+            float *cpos = (float *)(g_flags[0] + OFF_CP_POSITION);
+            float m = (cpos[0] - best[0]) * (cpos[0] - best[0]) + (cpos[2] - best[2]) * (cpos[2] - best[2]);
+            memcpy(cpos, best, 12); *own = 2; huntAt = GetTickCount();
+            if (m > 15.0f * 15.0f) { g_coopRetarget = 1; bot_log("coophunt: the bots go for the enemy at (%.0f, %.0f, %.0f)", best[0], best[1], best[2]); }
+        }
+        if (hunting && !best) {
+            hunting = 0;
+            memcpy(g_flags[0] + OFF_CP_POSITION, op, 12); *own = 1; g_coopRetarget = 1;
+            bot_log("coophunt: objective %d's wave is dead - back to the point", g_coopStage + 1);
+        }
+    } else hunting = 0;
+    // the stage moves on: the current objective is ours and no enemy soldier within 60 m of it for 5 s
+    static DWORD clearSince;
+    if (!hunting && g_coopStage < g_coopObjN && g_flagCount && *(int *)(g_flags[0] + OFF_CP_OWNER_TEAM) == 1) {
+        float *fp = g_coopObjPos[g_coopStage];
+        int enemies = 0;
+        for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+            char *o = arr[k];
+            float *p = o && player_team(o) == 2 && *(void **)(o + OFF_PLAYER_SOLDIER) ? human_pos(o) : NULL;
+            if (p && (p[0] - fp[0]) * (p[0] - fp[0]) + (p[2] - fp[2]) * (p[2] - fp[2]) < 60.0f * 60.0f) enemies++;
+        }
+        for (int e = 0; e < g_stageEnemyN; e++)   // (and the stage's own wave dead - the user: "when those waves are dead, the next")
+            if (g_stageEnemy[e] && !IsBadReadPtr(g_stageEnemy[e], 0x400) && *(void **)(g_stageEnemy[e] + OFF_PLAYER_SOLDIER) && player_team(g_stageEnemy[e]) == 2) enemies++;
+        if (enemies) clearSince = 0;
+        else if (!clearSince) clearSince = GetTickCount();
+        else if (GetTickCount() - clearSince > 5000) {
+            clearSince = 0;
+            g_coopStage++;
+            if (g_coopStage < g_coopObjN) {
+                chat_say("[BotMod] Objective %d secured - moving to objective %d", g_coopStage, g_coopStage + 1);
+                bot_log("coopobjective: stage %d secured - on to %s", g_coopStage, g_coopObjName[g_coopStage]);
+            } else {   // the escape is held: the mission is WON - the round ends with team 1 the winner (server.onRoundOver 1 = a pass;
+                       // swaphold then loads the next one - the user, 2026-10-29: "the final one is the escape ... the win condition")
+                chat_say("[BotMod] Final objective secured - mission complete!");
+                bot_log("coopobjective: the final objective (%s) secured - mapList.endRound 1 (a win)", g_coopObjName[g_coopObjN - 1]);
+                chat_rcon("mapList.endRound	1");
+            }
+            coop_stage_apply();
+        }
+    } else clearSince = 0;
+}
+// The objectives of the level, sorted by name (obj_1, obj_2 ... then obj_general / obj_final - the user, 2026-10-29: "a capture point
+// for each scripted area the bots stop at, the next one only once the previous is taken and no enemies are left, until the final LZ").
+// Only the CURRENT stage is a flag the bots go for; coop_capture_tick moves on.
+static void coop_stage_apply(void)
+{
+    g_flagCount = 0;
+    memset(g_flagSpawn, 0, sizeof g_flagSpawn);
+    if (g_coopStage >= g_coopObjN) return;   // (all done)
+    char *cp = g_coopFlag[0], *d = g_coopFlagData[0];
+    memset(cp, 0, sizeof g_coopFlag[0]); memset(d, 0, sizeof g_coopFlagData[0]);
+    *(void **)(cp + OFF_CP_OWNER_OBJECT) = cp + 0x1f0;   // (unique - no spawn entity shares it)
+    *(char **)(cp + OFF_CP_DATA) = d;
+    d[OFF_CPDATA_TAKEABLE] = 1;
+    *(int *)(cp + OFF_CP_OWNER_TEAM) = 2;
+    *(int *)(cp + OFF_CP_CONTROL_TEAM) = 0;
+    memcpy(cp + OFF_CP_POSITION, g_coopObjPos[g_coopStage], 12);
+    g_flags[g_flagCount++] = cp;
+    g_coopRetarget = 1;
+    float *p = g_coopObjPos[g_coopStage];
+    bot_log("coopobjective: stage %d of %d - %s at (%.0f, %.0f, %.0f)", g_coopStage + 1, g_coopObjN, g_coopObjName[g_coopStage], p[0], p[1], p[2]);
+}
+static int coop_objectives_load(void)
+{
+    char path[MAX_PATH + 64], l[256], lv[64], nm[64];
+    float p[3], yaw;
+    botmod_file(path, sizeof path, "coop_marks.txt");
+    FILE *f = fopen(path, "r");
+    const char *cur = current_level();
+    g_coopObjN = 0;
+    if (f && cur) {
+        while (fgets(l, sizeof l, f) && g_coopObjN < COOP_MAX_OBJ) {
+            if (l[0] == '#' || sscanf(l, "%63s %63s %f %f %f %f", lv, nm, &p[0], &p[1], &p[2], &yaw) != 6) continue;
+            if (_stricmp(lv, cur) || _strnicmp(nm, "obj", 3)) continue;
+            int k, dup = -1;
+            for (k = 0; k < g_coopObjN; k++) if (!_stricmp(g_coopObjName[k], nm)) dup = k;   // (the last line for a name wins)
+            k = dup >= 0 ? dup : g_coopObjN++;
+            snprintf(g_coopObjName[k], sizeof g_coopObjName[k], "%s", nm);
+            memcpy(g_coopObjPos[k], p, 12);
+        }
+    }
+    if (f) fclose(f);
+    for (int a = 0; a < g_coopObjN; a++)   // (sorted by name: obj_1 < obj_2 < ... < obj_general)
+        for (int b = a + 1; b < g_coopObjN; b++)
+            if (strcmp(g_coopObjName[b], g_coopObjName[a]) < 0) {
+                char t[64]; float tp[3];
+                memcpy(t, g_coopObjName[a], 64); memcpy(g_coopObjName[a], g_coopObjName[b], 64); memcpy(g_coopObjName[b], t, 64);
+                memcpy(tp, g_coopObjPos[a], 12); memcpy(g_coopObjPos[a], g_coopObjPos[b], 12); memcpy(g_coopObjPos[b], tp, 12);
+            }
+    if (g_coopStage > g_coopObjN) g_coopStage = 0;
+    coop_stage_apply();
+    return g_coopObjN;
+}
 
 // ---- Bot brain: respawn at HQ, capture the nearest flag the team does not own, repeat ----
 #define RESPAWN_DELAY_FRAMES  (5 * 30)
@@ -3049,6 +3234,8 @@ static void teams_fix_all(void);
 static void bot_say(int i, int orderType);
 static void bot_say_later_to(int i, int type, unsigned delayFrames, char *to);
 static void bot_say_to(int i, int orderType, char *to);
+static char *ctf_carrier(int t);
+static int ride_destination(int i, char *veh, int team, const float *vp, int heli, float *out, int *flag);
 static void bot_say_later(int i, int type, unsigned delayFrames);
 #define POSE_PRESS_FRAMES 8   // prone needs the button held a few frames (2 frames is ignored)
 // inwatch: a player's input levels (EntryInput +0x10, a float per action) and stance as they change - research
@@ -3939,7 +4126,10 @@ static char *player_vehicle(char *pl) { return *(char **)(pl + OFF_PLAYER_VEHICL
 static float *human_pos(char *pl)
 {
     char *s = *(char **)(pl + OFF_PLAYER_SOLDIER);
-    return s ? (float *)(s + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+    if (!s) return NULL;
+    float *v = (float *)(s + OFF_SOLDIER_POSITION);   // (a BotMod bot: its simulated position - the transform is junk for bots,
+    if (is_bot(pl) && (v[0] != 0 || v[2] != 0) && v[0] == v[0]) return v;   //  so the co-op capture never saw them on the point - 15:28)
+    return (float *)(s + OFF_SOLDIER_SPAWN_POSITION);
 }
 
 // Light-vehicle driving state (the driving code is with the tickets, further down)
@@ -6565,6 +6755,12 @@ static void order_reaction(char *sender, int type, char *target)
     if (type == ORDER_GETOUT && sveh) {
         for (int i = 0; i < H->botCount; i++) {
             if (player_vehicle(H->bots[i]) != sveh || H->bots[i] == sender) continue;   // (a bot driver gets out by itself)
+            if (is_ctf_mode() && ctf_carrier(3 - player_team(H->bots[i])) == H->bots[i]) {   // the flag carrier stays aboard - home first (the user,
+                int tm = player_team(H->bots[i]), atHome = 0;                                //  2026-10-27: it jumped out with the flag and walked)
+                float *vp0 = vehicle_pos(sveh, NULL);
+                for (int f = 0; f < g_flagCount && vp0; f++) if (flag_owner(f) == tm && dist2(flag_pos(f), vp0) < 40.0f * 40.0f) atHome = 1;
+                if (!atHome) { bot_log("ctf: %s keeps the flag aboard - not home yet", (char *)H->bots[i] + OFF_PLAYER_ONLINE_NAME); continue; }
+            }
             int byHuman = sender && !is_bot(sender);   // a human aboard says "Get out": a Pilot gives up its seat too - the human
             if (byHuman && is_pilot(i)) {              // takes the vehicle, the Pilot finds another ride (the user, 2026-10-13)
                 g_pilotForceExit = 1;
@@ -7304,8 +7500,8 @@ static int bot_spot(char *spotter, char *target)
 #define DETECT_COS_HALF_FOV    0.22f     // ~77 deg either side of the heading
 #define DETECT_ALL_AROUND      15.0f     // closer than this: noticed in any direction (heard)
 #define SPOT_COOLDOWN_FRAMES   (8 * 30)
-static unsigned g_spottedAt[64];          // by player slot: frame of the last bot spot
-static char *g_spottedWho[64];
+static unsigned g_spottedAt[128];         // by player slot: frame of the last bot spot (128: co-op's AI players come after 64)
+static char *g_spottedWho[128];
 
 // ---- Engaging what a bot has seen and spotted: armour is left to engineers with rockets (rocket_scan), everyone
 // else carries on. Infantry: medics, support and engineers advance on it while firing; recon fires from low cover.
@@ -7480,7 +7676,7 @@ static void detect_tick(int i)
     char *best = NULL, *bestVeh = NULL;
     float bestD = 1e30f;
     unsigned bestK = 0;
-    for (unsigned k = 0; k < count && k < 64; k++) {
+    for (unsigned k = 0; k < count && k < 128; k++) {
         char *t = arr[k];
         if (!t || t == pl || player_team(t) == player_team(pl)) continue;
         char *ts = *(char **)(t + OFF_PLAYER_SOLDIER), *veh = *(char **)(t + OFF_PLAYER_VEHICLE);
@@ -7914,9 +8110,17 @@ static void aim_stats_damage(void *soldier, void *giver, float before)
     }
     if (g_asShotAt[j] && H->frame - g_asShotAt[j] < 45 && g_fightSlot[j] == 0) g_asHits[cls][as_band(g_asShotDist[j])]++;
 }
+volatile LONG g_dmgCalls, g_dmgHuman;
 void __attribute__((thiscall)) hook_soldier_on_damage(void *soldier, void *a1, void *a2, void *a3)
 {
+    g_dmgCalls++;
+    { char *vp0 = soldier ? as_player_of(soldier) : NULL; if (vp0 && !is_bot(vp0) && !vp0[OFF_PLAYER_IS_AI]) g_dmgHuman++; }
     float hpBefore = soldier && !IsBadReadPtr((char *)soldier + OFF_SOLDIER_HEALTH, 4) ? *(float *)((char *)soldier + OFF_SOLDIER_HEALTH) : 0;
+    if (g_coopBotGod && soldier) {   // coopbotgod: a co-op squad bot takes no damage
+        char *vp = as_player_of(soldier);
+        const char *lv = current_level();
+        if (vp && is_bot(vp) && lv && strstr(lv, "COOP_")) return;
+    }
     note_attacker(soldier, a2);
     // With client-side hit detection on, damage from a server-simulated bullet (a1+0x58 bit 0x10) is ignored - the
     // shooter's client is expected to report the hit. Bots have no client: their bullets count as reported.
@@ -7946,7 +8150,9 @@ int __cdecl bot_damage_giver(void *giver)
     if (!giver || IsBadReadPtr(giver, 0x30)) return 0;
     typedef char *(__attribute__((thiscall)) *GetPlayer_t)(void *);
     char *pl = ((GetPlayer_t)0x00dd1de0)(giver);
-    int r = pl && is_bot(pl);
+    // (and the co-op mission's own AI players - no client reports their hits either: an AI's AK finally fired at a player
+    //  2026-10-30 and did no damage)
+    int r = pl && (is_bot(pl) || (!IsBadReadPtr(pl + OFF_PLAYER_IS_AI, 1) && pl[OFF_PLAYER_IS_AI]));
     if (r) g_hcBotPass++; else g_hcBlocked++;
     return r;
 }
@@ -7993,9 +8199,24 @@ __asm__(
     "  ret\n"
     ".att_syntax prefix\n");
 
+volatile LONG g_aiHits; static LONG g_aiHitLogged;
 void __cdecl on_process_hit(char *projectile, unsigned char *hit, unsigned *args)
 {
     (void)args;
+    {   // (2026-10-30: the co-op mission AI fire but never damage anyone - where do their server bullets land?)
+        void **r0 = !IsBadReadPtr(projectile + 0x84, 4) ? *(void ***)(projectile + 0x84) : NULL;
+        char *sh = r0 && !IsBadReadPtr(r0, 4) && *r0 ? (char *)*r0 - 8 : NULL;
+        if (sh && !IsBadReadPtr(sh + OFF_PLAYER_IS_AI, 1) && sh[OFF_PLAYER_IS_AI] && !is_bot(sh)) {
+            g_aiHits++;
+            if (g_aiHitLogged < 40 && hit && !IsBadReadPtr(hit, 0x24)) {
+                g_aiHitLogged++;
+                char *so = !IsBadReadPtr(sh + OFF_PLAYER_SOLDIER, 4) ? *(char **)(sh + OFF_PLAYER_SOLDIER) : NULL;
+                float *hp = (float *)hit, *sp = so ? (float *)(so + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+                bot_log("aihit: AI %p's bullet hit at (%.1f, %.1f, %.1f) entity %p - shooter at (%.1f, %.1f, %.1f)", sh, hp[0], hp[1], hp[2],
+                        *(void **)(hit + 0x20), sp ? sp[0] : 0, sp ? sp[1] : 0, sp ? sp[2] : 0);
+            }
+        }
+    }
     if (!g_gunDebug) return;   // aim measurement (console: gundebug 1): where a rifle bot's bullets land near its target
     void **ref = !IsBadReadPtr(projectile + 0x84, 4) ? *(void ***)(projectile + 0x84) : NULL;
     char *shooter = ref && !IsBadReadPtr(ref, 4) && *ref ? (char *)*ref - 8 : NULL;
@@ -8153,6 +8374,7 @@ static volatile DWORD g_mainTid;
 static unsigned g_hwAddr[4];
 static int g_hwCount = 2;   // (watchaddr: up to 4 addresses)
 static int g_hwRead;   // (watchunlocks <player> read: reads trap too)
+static int g_hwExec;   // (watchaddr ... exec: code breakpoints - each hit logs the registers; 2026-10-28, co-op spawn research)
 static volatile LONG g_hwHits;
 static PVOID g_hwVeh;
 static LONG CALLBACK hw_handler(EXCEPTION_POINTERS *ep)
@@ -8161,6 +8383,13 @@ static LONG CALLBACK hw_handler(EXCEPTION_POINTERS *ep)
     CONTEXT *cx = ep->ContextRecord;
     int which = (cx->Dr6 & 1) ? 0 : (cx->Dr6 & 2) ? 1 : (cx->Dr6 & 4) ? 2 : 3;
     cx->Dr6 = 0;
+    if (g_hwExec) {
+        cx->EFlags |= 0x10000;   // RF: run the instruction this time instead of trapping on it again
+        if (InterlockedIncrement(&g_hwHits) <= 60)
+            bot_log("watch: exec %08x | eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x esp %08x ebp %08x", (unsigned)cx->Eip,
+                    (unsigned)cx->Eax, (unsigned)cx->Ebx, (unsigned)cx->Ecx, (unsigned)cx->Edx, (unsigned)cx->Esi, (unsigned)cx->Edi, (unsigned)cx->Esp, (unsigned)cx->Ebp);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (InterlockedIncrement(&g_hwHits) <= 60) {
         char out[400];
         unsigned val = 0; SIZE_T got = 0;   // (read through the kernel: reading it here directly trips the trap again, and again)
@@ -8190,7 +8419,7 @@ static DWORD WINAPI hw_set_worker(LPVOID arg)   // (another thread: a thread's o
     CONTEXT cx; memset(&cx, 0, sizeof cx); cx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (GetThreadContext(th, &cx)) {
         if (on) {
-            unsigned rw = g_hwRead ? 0xF : 0xD;   // (4 bytes each: write - or read / write)
+            unsigned rw = g_hwExec ? 0 : g_hwRead ? 0xF : 0xD;   // (4 bytes each: write - or read / write; exec: len 0, type 0)
             cx.Dr0 = g_hwAddr[0]; cx.Dr1 = g_hwAddr[1]; cx.Dr2 = g_hwAddr[2]; cx.Dr3 = g_hwAddr[3]; cx.Dr7 = 0;
             for (int s = 0; s < g_hwCount && s < 4; s++) cx.Dr7 |= (1u << (s * 2)) | (rw << (16 + s * 4));
         }
@@ -10000,6 +10229,7 @@ static void level_tick(void)
         tickets_reset();
         strncpy(g_level, lvl, sizeof g_level - 1);
         g_levelReady = 0;
+        nav_set_max_expanded(0);   // (the defaults - co-op raises it when ready)
         g_flagCount = 0;
         memset(H->teamSpawn, 0, sizeof H->teamSpawn);
         for (int i = 0; i < H->botCount; i++) {
@@ -10020,6 +10250,16 @@ static void level_tick(void)
         memset(g_squadTarget, 0, sizeof g_squadTarget);   // flag indices belong to the old level
     }
     if (g_levelReady) return;
+    if (!strncmp(g_level, "COOP_", 5)) {   // (co-op: no flags / HQ / MP blueprint - discovery stalled there; ready at once, the
+        g_hqLess = 1;                      //  objectives from coop_marks.txt - 2026-10-29)
+        nav_set_max_expanded(400000);      // (one long route to the objective - the LZ to the general: 60000 ran out)
+        g_coopStage = 0;                   // (a new mission: stage 1)
+        g_stageWaveFor = -1; g_stageEnemyN = 0; g_squadDropAt = 0;
+        coop_objectives_load();
+        g_levelReady = 1;
+        bot_log("level: %s (co-op) ready - %d objective(s) from coop_marks.txt", g_level, g_flagCount);
+        return;
+    }
     if (H->frame < g_levelCheckAt) return;
     g_levelCheckAt = H->frame + 30;
     if (g_jobState == 1) return;                     // discovery running in the background
@@ -10046,7 +10286,10 @@ static void level_tick(void)
     }
     int dmLevel = is_dm_mode() || (is_rush_mode() && g_mcomN >= 2);   // (Rush: no flags / HQ either - its M-COMs and spawn points)   // (Deathmatch: no flags, no HQ - spawn points of each team's own)
     if (is_ctf_mode() && g_flagCount && !g_hqLess) { g_hqLess = 1; bot_log("level: %s - Capture the Flag: no HQ, each team spawns at its flag base", g_level); }
-    if ((!g_flagCount && !dmLevel) || (!g_jobHq && !g_hqLess && !dmLevel) || !blueprintOk) {
+    // co-op missions (2026-10-29): no flags, no HQ, no MP soldier blueprint - ready all the same, or the tick stops short of nav /
+    // brains every frame (the nav build on Fire from the Sky sat at 0 rays for 12 minutes)
+    int coopLevel = !strncmp(g_level, "COOP_", 5);
+    if ((!g_flagCount && !dmLevel && !coopLevel) || (!g_jobHq && !g_hqLess && !dmLevel && !coopLevel) || (!blueprintOk && !coopLevel)) {
         bot_log("level: %s not ready yet (%d flags, hq mask %d, blueprint %p)", g_level, g_flagCount, g_jobHq, g_jobBlueprint);
         g_levelCheckAt = H->frame + 60;
         return;
@@ -10089,6 +10332,20 @@ static void level_tick(void)
         snprintf(g_navGridMode, sizeof g_navGridMode, "%s", gm);
         nav_file(path, sizeof path, g_level);
         NavGrid *loaded = nav_load(path);
+        if (!loaded) {   // no grid of this mode yet: Squad / Team Deathmatch have no flags or HQs to size a new one from (server 6, MP_001
+            // Squad Deathmatch, 2026-10-30: "no sane area" - the bots waited for ever) - start from the map's own grid, or Conquest
+            // Large's (the biggest area); repairs learned here are saved under this mode's name
+            static const char *kFall[3] = {NULL, "ConquestLarge0", "ConquestSmall0"};
+            for (int k = 0; k < 3 && !loaded; k++) {
+                char fp[MAX_PATH + 64], dir[MAX_PATH];
+                GetModuleFileNameA(NULL, dir, sizeof dir);
+                *strrchr(dir, '\\') = 0;
+                if (kFall[k]) snprintf(fp, sizeof fp, "%s\\BotMod_nav_%s_%s.bin", dir, g_level, kFall[k]);
+                else snprintf(fp, sizeof fp, "%s\\BotMod_nav_%s.bin", dir, g_level);
+                loaded = nav_load(fp);
+                if (loaded) bot_log("level: no %s grid for %s yet - starting from %s", gm, g_level, fp);
+            }
+        }
         nav_free(*nav_slot());
         *nav_slot() = NULL;
         *nav_building() = 0;   // (the freed grid may have been mid-build - left "building", nav_tick built on into freed memory and crashed
@@ -10690,6 +10947,2272 @@ static void cmd_pos(const char *name)
 static int g_wtestBot = -1, g_wtestEia;
 static unsigned char g_jetHold[MAX_BOTS];   // console "jethold <bot#> on|off": BotMod neither flies nor drives its vehicle (weapon tests on the ground)
 static unsigned g_wtestFrom, g_wtestUntil;
+// ---- combatarea off|on (2026-10-28, bigger maps): ServerCombatAreaTriggerEntity::updateDeserters (0x00e55480, thiscall, no args,
+// plain ret; its only caller 0x00e56190 then counts each deserter's timer down, fires the warning event and kills at 0) - a "ret"
+// as its first byte means nobody is ever listed as a deserter, so nobody is killed for leaving the combat area. Kept in the
+// host (H->reserved+344: survives core reloads, not a server restart); the byte is put back at unload and re-applied by the next core.
+#define ADDR_CA_UPDATE_DESERTERS 0x00e55480
+static const unsigned char kCaDesertersPrologue[4] = {0x83, 0xEC, 0x24, 0xA1};   // sub esp,24h ; mov eax,[...]
+static int *combat_area_off(void) { return (int *)(H->reserved + 344); }
+static int g_caPatched;
+static void combat_area_write(const unsigned char *b)
+{
+    DWORD old;
+    VirtualProtect((void *)ADDR_CA_UPDATE_DESERTERS, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(unsigned char *)ADDR_CA_UPDATE_DESERTERS = b[0];
+    VirtualProtect((void *)ADDR_CA_UPDATE_DESERTERS, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_CA_UPDATE_DESERTERS, 1);
+}
+static void combat_area_tick(void)
+{
+    int want = *combat_area_off() == 1;
+    if (want == g_caPatched) return;
+    if (want) {
+        if (memcmp((void *)ADDR_CA_UPDATE_DESERTERS, kCaDesertersPrologue, 4) != 0) {
+            bot_log("ERROR: combatarea - updateDeserters bytes mismatch (wrong server build?) - left on");
+            *combat_area_off() = 0;
+            return;
+        }
+        static const unsigned char ret = 0xC3;
+        combat_area_write(&ret);
+        bot_log("combatarea: OFF - nobody is killed for leaving the combat area (\"combatarea on\" to restore)");
+    } else {
+        combat_area_write(kCaDesertersPrologue);
+        bot_log("combatarea: ON - the game's own out-of-bounds rule is back");
+    }
+    g_caPatched = want;
+}
+static void combat_area_unload(void) { if (g_caPatched) { combat_area_write(kCaDesertersPrologue); g_caPatched = 0; } }
+
+// ---- terrainfull on|off (2026-10-28, EXPERIMENT): the dedicated server loads only the terrain streaming tree's "persistent" nodes
+// (TerrainStreamingTree::loadPersistentDedicatedServerDataHelper 0x00ce2600: "cmp byte [nodeData],0 / je skip" at 0x00ce266f) -
+// on Bandar that is a central block; the rest of the 8 km terrain is only coarse parents (the terraces past ~1.5 km). The chunks for
+// EVERY node are on the server (Xp3Chunks: all 410 the tree names). NOPing the je makes it load every node not loaded yet (flags
+// 0x10/0x50/0x60) at the next level load. Kept in H->reserved+348 like combatarea; put back at unload.
+// Try 1 (10:12) crashed server 1: beginDataLoad 0x00ce2020 returned NULL for some node (no free load slot at tree+0x38..+0x3c /
+// the data allocation 0x00cd98f0 failed) -> assert "(dataLoad)" + a read of 0x74. So the two "dataLoad == NULL" assert blocks
+// (0x00ce269d main layer, 0x00ce26fc second layer) now jump on: skip that node's layer, carry on with its children.
+#define ADDR_TERRAIN_PERSIST_JE 0x00ce2672
+// Try 2 (10:15): ~42 nodes still refused - the heightfield ATLAS was full: HeightfieldTree atlas init 0x00cced20 sizes it to
+// ceil(N / tilesPerPage) pages (15 x 15 tiles of 133 samples on 2048-sample pages, max 16) with N = [atlas+0xac] = the persistent
+// tile count (Bandar 466 -> 3 pages = 675 tiles); [atlas+0xa8] = ALL the tree's tiles (741). Reading +0xa8 there (0x00ccee57)
+// sizes the atlas for every tile (Bandar 4 pages = 900; ~1 more 2048x2048 page of memory).
+static const struct { unsigned addr; unsigned char orig[6], patch[6]; int len; } kTf[4] = {
+    {0x00ce2672, {0x0F, 0x84, 0xEE, 0x00, 0x00, 0x00}, {0x90, 0x90, 0x90, 0x90, 0x90, 0x90}, 6},   // je skipNode (not persistent) -> nops
+    {0x00ce269d, {0x68, 0x7A, 0x59, 0x43, 0x02}, {0xE9, 0xC4, 0x00, 0x00, 0x00}, 5},                // NULL load -> jmp 0x00ce2766 (children)
+    {0x00ce26fc, {0x68, 0x7A, 0x59, 0x43, 0x02}, {0xE9, 0x38, 0x00, 0x00, 0x00}, 5},                // NULL 2nd layer -> jmp 0x00ce2739
+    {0x00ccee57, {0xAC}, {0xA8}, 1},                                                                 // atlas tiles: persistent -> all
+};
+static const unsigned char kTerrainPersistJe[6] = {0x0F, 0x84, 0xEE, 0x00, 0x00, 0x00};
+static int *terrain_full(void) { return (int *)(H->reserved + 348); }
+static int g_tfPatched;
+static void terrain_full_write(const unsigned char *b)
+{
+    int on = b != kTerrainPersistJe;
+    for (int k = 0; k < 4; k++) {
+        DWORD old;
+        void *a = (void *)kTf[k].addr;
+        VirtualProtect(a, kTf[k].len, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(a, on ? kTf[k].patch : kTf[k].orig, kTf[k].len);
+        VirtualProtect(a, kTf[k].len, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), a, kTf[k].len);
+    }
+}
+static void terrain_full_tick(void)
+{
+    int want = *terrain_full() == 1;
+    if (want == g_tfPatched) return;
+    if (want) {
+        if (memcmp((void *)kTf[0].addr, kTf[0].orig, 6) || memcmp((void *)kTf[1].addr, kTf[1].orig, 5) || memcmp((void *)kTf[2].addr, kTf[2].orig, 5) ||
+            memcmp((void *)kTf[3].addr, kTf[3].orig, 1)) {
+            bot_log("ERROR: terrainfull - loader bytes mismatch (wrong server build?) - left off");
+            *terrain_full() = 0;
+            return;
+        }
+        terrain_full_write(kTf[0].patch);
+        bot_log("terrainfull: ON - the next level load loads EVERY terrain node (change the map now)");
+    } else {
+        terrain_full_write(kTerrainPersistJe);
+        bot_log("terrainfull: OFF - persistent terrain nodes only (from the next level load)");
+    }
+    g_tfPatched = want;
+}
+static void terrain_full_unload(void) { if (g_tfPatched) { terrain_full_write(kTerrainPersistJe); g_tfPatched = 0; } }
+// terraininfo: the live terrain tree - nodes per level, loaded / not loaded
+static void terrain_info(void)
+{
+    char *mgr = *(char **)0x02b3df14, *tree = mgr ? *(char **)mgr : NULL;
+    if (!tree || IsBadReadPtr(tree, 0x60)) { bot_log("terraininfo: no terrain tree"); return; }
+    unsigned char *nodes = *(unsigned char **)(tree + 0x4c), *data = *(unsigned char **)(tree + 0x50);
+    int cnt[12] = {0}, loaded[12] = {0}, persist[12] = {0}, stack[256], sp = 0, depth[256];
+    stack[sp] = 0; depth[sp++] = 0;
+    while (sp > 0) {
+        sp--;
+        int i = stack[sp], d = depth[sp];
+        unsigned char *n = nodes + 16 * i;
+        if (IsBadReadPtr(n, 16) || d > 11) continue;
+        cnt[d]++;
+        if (n[6] & 0x20) loaded[d]++;
+        if (data[48 * i]) persist[d]++;
+        unsigned short ch = *(unsigned short *)(n + 8);
+        if (ch != 0xffff && sp + 4 <= 256) for (int k = 0; k < 4; k++) { stack[sp] = ch + k; depth[sp++] = d + 1; }
+    }
+    for (int d = 0; d < 12; d++)
+        if (cnt[d]) bot_log("terraininfo: level %d - %d node(s), %d loaded, %d persistent", d, cnt[d], loaded[d], persist[d]);
+}
+
+// ---- borders on|off (2026-10-28, bigger maps): the game's own out-of-bounds rule with OUR border. The warning a client shows is
+// driven by the server (the user saw no warning at all while updateDeserters was off), so the server's "is this player inside"
+// test decides everything: ServerCombatAreaTriggerEntity's inside test 0x00e53710 (thiscall (this, player, Vec3 *pos), ret 8,
+// returns al; only caller updateDeserters 0x00e55480, twice) is replaced by border_inside():
+//   aircraft (jets / helicopters): inside = more than BORDER_AIR_MARGIN inside the terrain's edge (the physics world ends at
+//     the terrain edge - the user got stuck there on Bandar)
+//   everyone else (ground vehicles, boats, on foot): that square AND not a zone cell of coarse collision (4 m+ cells: hills
+//     there are staircases; the user chose the 1 m + 2 m zone). Water and flat / unknown cells count as inside.
+// The zone map (100 m cells) is surveyed per level in the background after the level loads (13 x 1 m samples along x and z per
+// cell: the median run of equal heights is the collision cell size) and cached in Battlefield_3_Server\BotMod_zone_<level>.bin.
+// Until it is ready everyone counts as inside. Kept in H->reserved+352; "borders on" also undoes "combatarea off".
+#define ADDR_CA_INSIDE         0x00e53710
+static double perf_now(void);
+#define BORDER_AIR_MARGIN      500.0f
+#define ZONE_CELL              100.0f   // (the usual cell; terrains over ZONE_MAX cells of it use size / ZONE_MAX - g_zone.cell)
+#define ZONE_MAX               128
+enum { ZC_UNSEEN, ZC_GOOD, ZC_BAD, ZC_WATER, ZC_FLAT, ZC_NONE };
+static const unsigned char kCaInsidePrologue[5] = {0xB8, 0x40, 0x1F, 0x00, 0x00};   // mov eax, 1f40h
+static int *borders_on(void) { return (int *)(H->reserved + 352); }
+static int g_bordersPatched;
+static struct { int ready, w, k, built, terrainFull, noTerrain; float x0, z0, size, cell; char level[64]; void *tree; unsigned char c[ZONE_MAX * ZONE_MAX]; double ms; } g_zone;
+static int terrain_origin(float *x0, float *z0, float *size)
+{
+    char *mgr = *(char **)0x02b3df14, *tree = mgr ? *(char **)mgr : NULL;
+    if (!tree || IsBadReadPtr(tree, 0x60)) return 0;
+    char **pools = *(char ***)(tree + 8);
+    char *hf = pools && !IsBadReadPtr(pools, 4) ? pools[0] : NULL;
+    if (!hf || IsBadReadPtr(hf + 0x50, 16)) return 0;
+    *x0 = *(float *)(hf + 0x50); *z0 = *(float *)(hf + 0x54); *size = (float)*(unsigned *)(hf + 0x5c);
+    return isfinite(*x0) && isfinite(*z0) && *size >= 256.0f && *size <= 16384.0f;
+}
+// 1 when the live terrain tree has every node loaded (none left in the not-loaded states 0x10 / 0x50 / 0x60) - i.e. this level
+// was loaded with terrainfull on. (2026-10-28: servers 2-4 got the core while their levels had only the persistent nodes: their
+// zone surveys saw coarse outer ground and were cached as if full.)
+static int terrain_all_loaded(void)
+{
+    char *mgr = *(char **)0x02b3df14, *tree = mgr ? *(char **)mgr : NULL;
+    if (!tree || IsBadReadPtr(tree, 0x60)) return 0;
+    unsigned char *nodes = *(unsigned char **)(tree + 0x4c);
+    int stack[512], sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int i = stack[--sp];
+        unsigned char *nd = nodes + 16 * i;
+        if (IsBadReadPtr(nd, 16)) return 0;
+        if (nd[6] == 0x10 || nd[6] == 0x50 || nd[6] == 0x60) return 0;
+        unsigned short ch = *(unsigned short *)(nd + 8);
+        if (ch != 0xffff && sp + 4 <= 512) for (int k = 0; k < 4; k++) stack[sp++] = ch + k;
+    }
+    return 1;
+}
+static void zone_path(char *path, int n)
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    *strrchr(dir, '\\') = 0;
+    snprintf(path, n, "%s\\BotMod_zone_%s.bin", dir, g_zone.level);
+}
+#define ZONE_MAGIC 0x38454E5A   // "ZNE8" (8: terrain-only ledges, no height cap)
+static void zone_save(void)
+{
+    char path[MAX_PATH + 64];
+    zone_path(path, sizeof path);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    int hdr[4] = {ZONE_MAGIC, g_zone.w, g_zone.terrainFull, (int)lroundf(g_zone.cell * 10.0f)};
+    float fl[3] = {g_zone.x0, g_zone.z0, g_zone.size};
+    fwrite(hdr, sizeof hdr, 1, f); fwrite(fl, sizeof fl, 1, f); fwrite(g_zone.c, 1, g_zone.w * g_zone.w, f);
+    fclose(f);
+}
+static int zone_load(void)
+{
+    char path[MAX_PATH + 64];
+    zone_path(path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int hdr[4], ok = 0; float fl[3];
+    if (fread(hdr, sizeof hdr, 1, f) == 1 && fread(fl, sizeof fl, 1, f) == 1 && hdr[0] == ZONE_MAGIC && hdr[1] == g_zone.w &&
+        (hdr[3] ? hdr[3] : 1000) == (int)lroundf(g_zone.cell * 10.0f) &&
+        hdr[2] == g_zone.terrainFull && fl[0] == g_zone.x0 && fl[1] == g_zone.z0 && fl[2] == g_zone.size &&
+        fread(g_zone.c, 1, g_zone.w * g_zone.w, f) == (size_t)(g_zone.w * g_zone.w)) ok = 1;
+    fclose(f);
+    return ok;
+}
+// One cell: 13 samples 1 m apart along x and along z through its middle. Coarse = a STAIRCASE: 2+ ledges, i.e. a jump of
+// 0.2-3 m between neighbouring samples next to a flat run (identical heights). (v1 used the median run of identical heights:
+// heights are stored in ~1.5 cm steps, so nearly level 1 m ground - beaches - also has runs and read coarse. A smooth 1 m slope,
+// even a steep one, has no flat runs, so no ledges; jumps over 3 m are buildings / rocks.)
+#define ZONE_LEDGE_MAX 3.0f
+static float g_zoneLedgeMin = 0.2f;   // console: borders ledge <m> <count> (then the survey runs again)
+static int g_zoneLedgeCount = 2;
+// The last ray hit the TERRAIN (its physics entity, vt 02485998 on every map seen: Metro, Bandar, Tehran) - not a building / rock.
+static int hit_is_terrain(void)
+{
+    void *b = *(void **)g_lastHitRest;
+    return b && !IsBadReadPtr(b, 4) && *(unsigned *)b == 0x02485998;
+}
+static int zone_cell_classify(float cx, float cz)
+{
+    int hits = 0, ledges = 0;
+    float lo = 1e9f, hi = -1e9f;
+    for (int axis = 0; axis < 2; axis++) {
+        float h[13];
+        int ok[13], ter[13];
+        for (int s = 0; s < 13; s++) {
+            float x = cx + (axis ? 0 : s - 6), z = cz + (axis ? s - 6 : 0), a[3] = {x, 2000.0f, z}, b[3] = {x, -500.0f, z}, p[3];
+            ok[s] = ray_cast(a, b, p, NULL);
+            ter[s] = ok[s] && hit_is_terrain();
+            h[s] = ok[s] ? p[1] : 0;
+            if (ok[s]) { hits++; if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }
+        }
+        for (int s = 1; s < 13; s++) {
+            if (!ter[s] || !ter[s - 1]) continue;   // (only terrain-to-terrain jumps: buildings / rocks are not the ground's stairs)
+            float d = fabsf(h[s] - h[s - 1]);
+            if (d < g_zoneLedgeMin) continue;       // (no upper limit: Tehran's 32 m cells step 3.5-4.6 m - the old 3 m cap hid them)
+            int flatBefore = s >= 2 && ter[s - 2] && fabsf(h[s - 1] - h[s - 2]) < 0.0002f;
+            int flatAfter = s <= 11 && ter[s + 1] && fabsf(h[s + 1] - h[s]) < 0.0002f;
+            if (flatBefore || flatAfter) ledges++;
+        }
+    }
+    if (hits < 13) return ZC_NONE;
+    if (hi - lo < 0.01f && fabsf(lo) < 0.001f && fabsf(hi) < 0.001f) return ZC_NONE;   // unauthored terrain: a plane at exactly y 0
+        // (Damavand / Tehran: a 0-height floor far below the real ground round the authored area read as 51 / 44 km2 'smooth')
+    if (hi - lo < 0.01f) {   // perfectly flat: the sea (an object, not terrain) or a flat road / runway
+        unsigned saved = g_rayFlags;
+        g_rayFlags = RAY_DONT_CHECK_CHARACTER | 0x08;   // (skip terrain)
+        float a[3] = {cx, 2000.0f, cz}, b[3] = {cx, -500.0f, cz}, p[3];
+        int water = ray_cast(a, b, p, NULL) && fabsf(p[1] - lo) < 0.05f;
+        g_rayFlags = saved;
+        if (water) return ZC_WATER;
+        // Level on the 13 m cross - truly level ground, or VERY coarse data (16 m+ flat cells: the cross sits inside one cell;
+        // Tehran / Damavand read 45-48 km2 "smooth", 2026-10-28). A 64 m cross (17 samples 4 m apart) shows those as ledges.
+        int ledges4 = 0;
+        for (int axis = 0; axis < 2; axis++) {
+            float h[17];
+            int ok[17], ter[17];
+            for (int s = 0; s < 17; s++) {
+                float x = cx + (axis ? 0 : (s - 8) * 4.0f), z = cz + (axis ? (s - 8) * 4.0f : 0), a2[3] = {x, 2000.0f, z}, b2[3] = {x, -500.0f, z}, p2[3];
+                ok[s] = ray_cast(a2, b2, p2, NULL);
+                ter[s] = ok[s] && hit_is_terrain();
+                h[s] = ok[s] ? p2[1] : 0;
+            }
+            for (int s = 1; s < 17; s++) {
+                if (!ter[s] || !ter[s - 1]) continue;
+                float d = fabsf(h[s] - h[s - 1]);
+                if (d < g_zoneLedgeMin) continue;
+                int flatBefore = s >= 2 && ter[s - 2] && fabsf(h[s - 1] - h[s - 2]) < 0.0002f;
+                int flatAfter = s <= 15 && ter[s + 1] && fabsf(h[s + 1] - h[s]) < 0.0002f;
+                if (flatBefore || flatAfter) ledges4++;
+            }
+        }
+        return ledges4 >= g_zoneLedgeCount ? ZC_BAD : ZC_FLAT;
+    }
+    return ledges >= g_zoneLedgeCount ? ZC_BAD : ZC_GOOD;
+}
+// After the survey: the raw cells are noisy (13 samples a line catch a ledge or not - speckle; far 8 m plains read smooth as
+// islands nobody can drive to). 1) majority filter over land cells (3x3, twice; flat cells count as smooth), 2) keep only the
+// smooth area connected to the terrain's middle (nearest smooth cell to it), 3) coarse pockets enclosed by that area (not touching
+// the map edge or water) and under 30 cells become smooth. The rest of the land is coarse. (Prototyped on Bandar 2026-10-28:
+// 14.1 km2 raw smooth -> 7.7 km2 connected; the stock combat area always counts as inside anyway.)
+static void zone_cleanup(void)
+{
+    int w = g_zone.w, n = w * w;
+    static unsigned char good[ZONE_MAX * ZONE_MAX], nxt[ZONE_MAX * ZONE_MAX], keep[ZONE_MAX * ZONE_MAX], seen[ZONE_MAX * ZONE_MAX];
+    static int queue[ZONE_MAX * ZONE_MAX];
+    static const int ddx[4] = {1, -1, 0, 0}, ddz[4] = {0, 0, 1, -1};
+    unsigned char *c = g_zone.c;
+#define ZLAND(i) (c[i] == ZC_GOOD || c[i] == ZC_BAD || c[i] == ZC_FLAT)
+    for (int i = 0; i < n; i++) good[i] = c[i] == ZC_GOOD || c[i] == ZC_FLAT;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            if (!ZLAND(i)) { nxt[i] = good[i]; continue; }
+            int ix = i % w, iz = i / w, g = 0, t = 0;
+            for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
+                int jx = ix + dx, jz = iz + dz;
+                if (jx < 0 || jz < 0 || jx >= w || jz >= w) continue;
+                int j = jz * w + jx;
+                if (ZLAND(j)) { t++; g += good[j]; }
+            }
+            nxt[i] = g * 2 > t;
+        }
+        memcpy(good, nxt, n);
+    }
+    // Seeds: every flag on smooth ground (or the nearest smooth cell within 300 m) when BotMod knows the flags (bots on); with none,
+    // the smooth cell nearest the terrain's middle.
+    int qh = 0, qt = 0;
+    memset(keep, 0, n);
+    if ((*wanted_bots() || H->botCount) && g_flagCount > 0) {
+        for (int f = 0; f < g_flagCount; f++) {
+            float *fp = flag_pos(f);
+            int fx = (int)floorf((fp[0] - g_zone.x0) / g_zone.cell), fz = (int)floorf((fp[2] - g_zone.z0) / g_zone.cell), bi = -1;
+            float bd = 1e30f;
+            for (int dz = -3; dz <= 3; dz++) for (int dx = -3; dx <= 3; dx++) {
+                int jx = fx + dx, jz = fz + dz;
+                if (jx < 0 || jz < 0 || jx >= w || jz >= w || !good[jz * w + jx]) continue;
+                float d = (float)(dx * dx + dz * dz);
+                if (d < bd) { bd = d; bi = jz * w + jx; }
+            }
+            if (bi >= 0 && !keep[bi]) { keep[bi] = 1; queue[qt++] = bi; }
+        }
+    }
+    if (!qt) {
+        int seed = -1;
+        float best = 1e30f, mx = (w - 1) * 0.5f;
+        for (int i = 0; i < n; i++)
+            if (good[i]) { float dx = i % w - mx, dz = i / w - mx, d = dx * dx + dz * dz; if (d < best) { best = d; seed = i; } }
+        if (seed >= 0) { keep[seed] = 1; queue[qt++] = seed; }
+    }
+    if (qt) {
+        while (qh < qt) {
+            int i = queue[qh++], ix = i % w, iz = i / w;
+            for (int k = 0; k < 4; k++) {
+                int jx = ix + ddx[k], jz = iz + ddz[k];
+                if (jx < 0 || jz < 0 || jx >= w || jz >= w) continue;
+                int j = jz * w + jx;
+                if (good[j] && !keep[j]) { keep[j] = 1; queue[qt++] = j; }
+            }
+        }
+    }
+    memset(seen, 0, n);
+    for (int s = 0; s < n; s++) {
+        if (seen[s] || keep[s] || !ZLAND(s)) continue;
+        int qh = 0, qt = 0, edge = 0;
+        queue[qt++] = s; seen[s] = 1;
+        while (qh < qt) {   // (queue[0..qt) is the pocket)
+            int i = queue[qh++], ix = i % w, iz = i / w;
+            for (int k = 0; k < 4; k++) {
+                int jx = ix + ddx[k], jz = iz + ddz[k];
+                if (jx < 0 || jz < 0 || jx >= w || jz >= w) { edge = 1; continue; }
+                int j = jz * w + jx;
+                if (c[j] == ZC_WATER || c[j] == ZC_NONE) edge = 1;
+                if (!seen[j] && !keep[j] && ZLAND(j)) { seen[j] = 1; queue[qt++] = j; }
+            }
+        }
+        if (!edge && qt < 30) for (int k = 0; k < qt; k++) keep[queue[k]] = 2;
+    }
+    for (int i = 0; i < n; i++) if (ZLAND(i)) c[i] = keep[i] ? ZC_GOOD : ZC_BAD;
+#undef ZLAND
+}
+static void zone_tick(void)
+{
+    if (*borders_on() != 1) return;   // (only our borders use the survey - up to 3 ms a tick on every new map; off by default, 2026-11-03)
+    const char *lv = current_level();
+    char *mgr = *(char **)0x02b3df14, *tree = mgr ? *(char **)mgr : NULL;
+    if (!lv) return;
+    if (!tree) {   // a level with no terrain at all (Seine Crossing: all meshes) - the stock combat area there (2026-10-28: the
+                   // zone code used to wait for a terrain and kept the previous map's zone - Bazaar's on Seine)
+        if (!g_zone.noTerrain || strcmp(lv, g_zone.level)) {
+            memset(&g_zone, 0, sizeof g_zone);
+            snprintf(g_zone.level, sizeof g_zone.level, "%s", lv);
+            g_zone.noTerrain = 1;
+            bot_log("zone: %s has no terrain - the stock combat area applies there", lv);
+        }
+        return;
+    }
+    if (strcmp(lv, g_zone.level) || tree != g_zone.tree) {   // a new level (or the same one loaded again)
+        float x0, z0, size;
+        if (!terrain_origin(&x0, &z0, &size)) return;
+        memset(&g_zone, 0, sizeof g_zone);
+        snprintf(g_zone.level, sizeof g_zone.level, "%s", lv);
+        g_zone.tree = tree; g_zone.x0 = x0; g_zone.z0 = z0; g_zone.size = size;
+        // 100 m cells; a terrain over 12.8 km (Wake, Kharg: 16 km) gets bigger cells so the map still covers ALL of it
+        // (2026-10-28: the grid was capped at 128 cells of 100 m - the far part of Wake's terrain read "no ground")
+        g_zone.cell = size > ZONE_MAX * ZONE_CELL ? size / ZONE_MAX : ZONE_CELL;
+        g_zone.w = (int)ceilf(size / g_zone.cell);
+        if (g_zone.w > ZONE_MAX) g_zone.w = ZONE_MAX;
+        g_zone.terrainFull = terrain_all_loaded();   // (what this load really has - not the switch)
+        if (zone_load()) { g_zone.ready = 1; bot_log("zone: %s loaded from the cache (%d x %d cells of %.0f m)", lv, g_zone.w, g_zone.w, g_zone.cell); return; }
+        bot_log("zone: surveying %s's ground (%d x %d cells of %.0f m, terrain %.0f m from (%.0f, %.0f))%s", lv, g_zone.w, g_zone.w, g_zone.cell,
+                size, x0, z0, g_zone.terrainFull ? "" : " - NOT all terrain is loaded (level loaded without terrainfull): the outer ring reads "
+                "coarse and this survey is not cached - the next load of this map surveys again");
+    }
+    if (g_zone.ready) return;
+    double t0 = perf_now();
+    unsigned saved = g_rayFlags;
+    g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+    int n = g_zone.w * g_zone.w;
+    while (g_zone.k < n && perf_now() - t0 < 3.0) {
+        int ix = g_zone.k % g_zone.w, iz = g_zone.k / g_zone.w;
+        g_zone.c[g_zone.k] = zone_cell_classify(g_zone.x0 + (ix + 0.5f) * g_zone.cell, g_zone.z0 + (iz + 0.5f) * g_zone.cell);
+        g_zone.k++;
+    }
+    g_rayFlags = saved;
+    g_zone.ms += perf_now() - t0;
+    if (g_zone.k < n) return;
+    zone_cleanup();
+    int cnt[6] = {0};
+    double km2 = (double)g_zone.cell * g_zone.cell / 1e6;
+    for (int i = 0; i < n; i++) cnt[g_zone.c[i]]++;
+    g_zone.ready = 1;
+    if (g_zone.terrainFull) zone_save();
+    bot_log("zone: %s surveyed in %.1f s of ray time - smooth %.1f km2, coarse %.1f km2, water %.1f km2, flat %.1f, no ground %.1f",
+            g_zone.level, g_zone.ms / 1000.0, cnt[ZC_GOOD] * km2, cnt[ZC_BAD] * km2, cnt[ZC_WATER] * km2, cnt[ZC_FLAT] * km2, cnt[ZC_NONE] * km2);
+}
+static int zone_at(float x, float z)
+{
+    if (!g_zone.ready) return ZC_UNSEEN;
+    int ix = (int)floorf((x - g_zone.x0) / g_zone.cell), iz = (int)floorf((z - g_zone.z0) / g_zone.cell);
+    if (ix < 0 || iz < 0 || ix >= g_zone.w || iz >= g_zone.w) return ZC_NONE;
+    return g_zone.c[iz * g_zone.w + ix];
+}
+static struct { void *pl; int out; } g_borderSeen[64];
+// The stock test, still callable: the hook only replaced its first instruction (mov eax, 1f40h - 5 bytes), so a trampoline of
+// that instruction + jmp 0x00e53715 runs the original. The user's rule: the new border may never be tighter than the old one -
+// inside the stock combat area always counts as inside.
+typedef char (__attribute__((thiscall)) *CaInside_t)(void *self, char *pl, float *pos);
+static unsigned char *g_caTramp;
+static CaInside_t ca_inside_orig(void)
+{
+    if (!g_caTramp) {
+        g_caTramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!g_caTramp) return NULL;
+        memcpy(g_caTramp, kCaInsidePrologue, 5);
+        g_caTramp[5] = 0xE9;
+        *(DWORD *)(g_caTramp + 6) = (DWORD)((unsigned char *)ADDR_CA_INSIDE + 5 - (g_caTramp + 10));
+        FlushInstructionCache(GetCurrentProcess(), g_caTramp, 16);
+    }
+    return (CaInside_t)g_caTramp;
+}
+static char __attribute__((thiscall)) border_inside(void *self, char *pl, float *pos)
+{
+    CaInside_t orig = ca_inside_orig();
+    if (orig && orig(self, pl, pos)) return 1;   // inside the stock area
+    if (g_zone.noTerrain) return 0;              // (no terrain: stock only)
+    if (!g_zone.ready || !pl || IsBadReadPtr(pl, OFF_PLAYER_VEHICLE + 4)) return 1;
+    char *veh = *(char **)(pl + OFF_PLAYER_VEHICLE);
+    int vk = veh && vehicle_ok(veh) ? vehicle_kind(veh) : -1, air = vk == VK_JET || vk == VK_HELI;
+    float *p = veh && vk >= 0 ? vehicle_pos(veh, NULL) : NULL;
+    if (!p) p = pos && !IsBadReadPtr(pos, 12) ? pos : NULL;
+    if (!p || !isfinite(p[0]) || !isfinite(p[2])) return 1;
+    // Aircraft: BORDER_AIR_MARGIN inside the terrain's edge. Everyone else (2026-10-28 v3, "like Bandar on every map"): smooth
+    // ground connected to the play area (ZC_GOOD after zone_cleanup); water only inside that square (boats - the world's edge is
+    // sticky); rough ground and NO ground (Metro: the city is meshes, the rest is void - the user fell through) are outside.
+    // The terrain square no longer limits the ground (on Metro it missed half the park).
+    float m = BORDER_AIR_MARGIN;
+    int sq = p[0] > g_zone.x0 + m && p[0] < g_zone.x0 + g_zone.size - m && p[2] > g_zone.z0 + m && p[2] < g_zone.z0 + g_zone.size - m;
+    int in = sq, c = air ? ZC_GOOD : zone_at(p[0], p[2]);
+    const char *why = "the edge of the world";
+    if (!air) {
+        float e = 300.0f;   // water: inside unless within 300 m of the terrain's edge (the sticky band is ~250 m; Metro's park pond is 400 m in)
+        int sqWater = p[0] > g_zone.x0 + e && p[0] < g_zone.x0 + g_zone.size - e && p[2] > g_zone.z0 + e && p[2] < g_zone.z0 + g_zone.size - e;
+        in = c == ZC_GOOD || (c == ZC_WATER && sqWater);
+        why = c == ZC_NONE ? "no ground (the void)" : c == ZC_BAD ? "rough ground (coarse collision)" : "the edge of the world";
+    }
+    int slot = -1;   // log changes (this runs every tick for every player)
+    for (int k = 0; k < 64 && slot < 0; k++) if (g_borderSeen[k].pl == pl) slot = k;
+    if (slot < 0) for (int k = 0; k < 64 && slot < 0; k++) if (!g_borderSeen[k].pl) { slot = k; g_borderSeen[k].pl = pl; g_borderSeen[k].out = 0; }
+    if (slot >= 0 && g_borderSeen[slot].out != !in) {
+        g_borderSeen[slot].out = !in;
+        bot_log("border: %s is %s at (%.0f, %.0f)%s%s", pl + OFF_PLAYER_ONLINE_NAME, in ? "back inside" : "OUTSIDE", p[0], p[2], in ? "" : " - ", in ? "" : why);
+    }
+    return (char)in;
+}
+static void borders_write(int on)
+{
+    unsigned char b[5];
+    if (on) { b[0] = 0xE9; *(DWORD *)(b + 1) = (DWORD)((unsigned char *)border_inside - ((unsigned char *)ADDR_CA_INSIDE + 5)); }
+    else memcpy(b, kCaInsidePrologue, 5);
+    DWORD old;
+    VirtualProtect((void *)ADDR_CA_INSIDE, 5, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void *)ADDR_CA_INSIDE, b, 5);
+    VirtualProtect((void *)ADDR_CA_INSIDE, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_CA_INSIDE, 5);
+}
+// ---- BotMod\borders.txt (2026-10-28): the bigger-map settings, read at core start and at every level load, so they survive server
+// restarts. Lines: "terrainfull on|off" and "borders <level|*|prefix*> <mode|*|prefix*> on|off" (the first matching borders line
+// wins; e.g. "borders * Rush* off"). borders on = BotMod's border + the game's kill; off = the stock combat area. No file = the
+// console settings stay as they are.
+static int cfg_match(const char *pat, const char *s)
+{
+    size_t n = strlen(pat);
+    if (!strcmp(pat, "*")) return 1;
+    if (n && pat[n - 1] == '*') return !_strnicmp(pat, s, n - 1);
+    return !_stricmp(pat, s);
+}
+static int g_terrainHold = -1;
+static int g_caHold;   // combatarea hold off: borders.txt's "borders ... on" no longer switches the combat-area kill back on
+                       // (2026-10-29: server 5's startup "combatarea off" was undone by its boot map XP5_001 - borders on)   // terrainfull hold on|off: this server's own setting - borders.txt's terrainfull is ignored (-1: none)
+static int borders_config(const char *level, const char *mode)   // 1 = the file was read
+{
+    char dir[MAX_PATH], path[MAX_PATH + 32], line[256];
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    *strrchr(dir, '\\') = 0;
+    char *up = strrchr(dir, '\\');
+    if (up) *up = 0;
+    snprintf(path, sizeof path, "%s\\BotMod\\borders.txt", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int matched = 0, on = -1, tf = -1;
+    while (fgets(line, sizeof line, f)) {
+        char a[32] = "", b[96] = "", c[96] = "", d[16] = "";
+        int k = sscanf(line, "%31s %95s %95s %15s", a, b, c, d);
+        if (k < 2 || a[0] == '#') continue;
+        if (!_stricmp(a, "terrainfull")) tf = !_stricmp(b, "on");
+        else if (!_stricmp(a, "borders") && k == 4 && !matched && level && mode && cfg_match(b, level) && cfg_match(c, mode)) { matched = 1; on = !_stricmp(d, "on"); }
+    }
+    fclose(f);
+    if (g_terrainHold >= 0) tf = g_terrainHold;   // (startup_<port>.txt: e.g. the co-op server - Fire from the Sky's terrain crashed it)
+    if (tf >= 0 && *terrain_full() != tf) { *terrain_full() = tf; terrain_full_tick(); }
+    if (on >= 0 && level) {
+        if (on) { *borders_on() = 1; if (!g_caHold) *combat_area_off() = 0; }
+        else *borders_on() = 0;
+        combat_area_tick();
+        bot_log("borders.txt: %s %s -> borders %s (terrainfull %s)", level, mode, on ? "ON" : "OFF (stock combat area)", *terrain_full() == 1 ? "on" : "off");
+    }
+    return 1;
+}
+static void borders_tick(void)
+{
+    {   // borders.txt at each new level / mode (the mode comes from RCON a little after the level - wait for it)
+        static char lastKey[160];
+        const char *lv = current_level();
+        char mode[64] = "", key[160];
+        chat_game_mode(mode, sizeof mode);
+        if (lv && mode[0]) {
+            snprintf(key, sizeof key, "%s|%s|%p", lv, mode, *(void **)0x02b3df14 ? **(void ***)0x02b3df14 : NULL);
+            if (strcmp(key, lastKey)) { strcpy(lastKey, key); borders_config(lv, mode); }
+        }
+    }
+    zone_tick();
+    int want = *borders_on() == 1;
+    if (want == g_bordersPatched) return;
+    if (want) {
+        if (memcmp((void *)ADDR_CA_INSIDE, kCaInsidePrologue, 5) != 0) {
+            bot_log("ERROR: borders - inside-test bytes mismatch (wrong server build?) - left off");
+            *borders_on() = 0;
+            return;
+        }
+        borders_write(1);
+        memset(g_borderSeen, 0, sizeof g_borderSeen);
+        bot_log("borders: ON - the game's out-of-bounds rule with BotMod's border (aircraft %.0f m inside the terrain edge, ground: no coarse-"
+                "collision cells)%s", BORDER_AIR_MARGIN, g_zone.ready ? "" : " - zone map not ready yet: everyone counts as inside");
+    } else {
+        borders_write(0);
+        bot_log("borders: OFF - the stock combat area");
+    }
+    g_bordersPatched = want;
+}
+static void borders_unload(void)
+{
+    if (g_bordersPatched) { borders_write(0); g_bordersPatched = 0; }
+    if (g_caTramp) { VirtualFree(g_caTramp, 0, MEM_RELEASE); g_caTramp = NULL; }
+}
+
+// ---- physshift <entity hex> <dy> | undo (2026-10-28 EXPERIMENT, invisible walls): moves a static physics entity's Havok body
+// straight up (or back). Metro's invisible walls are ONE static group entity (vt 02490c38, ray material 0, also roofs over the
+// city): entity +0x60 = hkpRigidBody (vt 02738b78; +0x08 world, +0x10 shape, +0x18 cdBody motion -> body+0xf0 = its own
+// hkMotionState: rotation rows +0x00..+0x2f, translation +0x30, swept centres of mass +0x40 / +0x50). The broadphase AABB stays
+// where it was, so queries still find the body there, but the narrow phase uses the transform: nothing is hit any more.
+// Purpose: is a soldier blocked by the SERVER's collision (then walls can be removed server-side) or only by his client's copy?
+static struct { float *ms; float dy; } g_physShift[8];
+static int g_physShiftN;
+static void phys_shift(const char *args)
+{
+    if (!strncmp(args, "undo", 4)) {
+        while (g_physShiftN > 0) {
+            g_physShiftN--;
+            float *ms = g_physShift[g_physShiftN].ms, dy = g_physShift[g_physShiftN].dy;
+            if (!IsBadWritePtr(ms, 0x60)) { ms[12 + 1] -= dy; ms[16 + 1] -= dy; ms[20 + 1] -= dy; }
+            bot_log("physshift: motion state %p back down %.0f m", ms, dy);
+        }
+        return;
+    }
+    unsigned ent = 0;
+    float dy = 5000.0f;
+    if (sscanf(args, "%x %f", &ent, &dy) < 1 || !ent) { bot_log("usage: physshift <entity hex> [dy] | physshift undo"); return; }
+    char *e = (char *)ent;
+    if (IsBadReadPtr(e, 0x64)) { bot_log("physshift: %p unreadable", e); return; }
+    char *hb = *(char **)(e + 0x60);
+    if (!hb || IsBadReadPtr(hb, 0x100) || *(unsigned *)hb != 0x02738b78) { bot_log("physshift: %p +0x60 is no rigid body (%p)", e, hb); return; }
+    float *ms = *(float **)(hb + 0x18);
+    if ((char *)ms != hb + 0xf0 || IsBadWritePtr(ms, 0x60)) { bot_log("physshift: unexpected motion state %p (body %p)", ms, hb); return; }
+    if (g_physShiftN >= 8) { bot_log("physshift: undo first"); return; }
+    ms[12 + 1] += dy; ms[16 + 1] += dy; ms[20 + 1] += dy;   // translation.y, centreOfMass0.y, centreOfMass1.y
+    g_physShift[g_physShiftN].ms = ms; g_physShift[g_physShiftN].dy = dy; g_physShiftN++;
+    bot_log("physshift: entity %p body %p moved up %.0f m (translation now %.1f %.1f %.1f) - \"physshift undo\" to put it back",
+            e, hb, dy, ms[12], ms[13], ms[14]);
+}
+
+// A vehicle's Havok body: veh+0x30 (physics component) +0xa0 = hkpRigidBody (vt 02738b78), its hkMotionState at body+0xf0
+// (rotation +0x00..+0x2f, translation +0x30, swept centres of mass +0x40 / +0x50 - see phys_shift). Teleport = the same delta on all
+// three (2026-10-28, co-op: a spare spawner's AH-1Z appears out of bounds - moved next to the players' one). 1 = moved.
+static int vehicle_teleport(char *veh, const float *to)
+{
+    char *ph = veh && !IsBadReadPtr(veh + 0x30, 4) ? *(char **)(veh + 0x30) : NULL;
+    char *hb = ph && !IsBadReadPtr(ph + 0xa0, 4) ? *(char **)(ph + 0xa0) : NULL;
+    if (!hb || IsBadReadPtr(hb, 0x100) || *(unsigned *)hb != 0x02738b78) return 0;
+    float *ms = *(float **)(hb + 0x18);
+    if ((char *)ms != hb + 0xf0 || IsBadWritePtr(ms, 0x60)) return 0;
+    for (int k = 0; k < 3; k++) {
+        float d = to[k] - ms[12 + k];
+        ms[12 + k] += d; ms[16 + k] += d; ms[20 + k] += d;
+    }
+    return 1;
+}
+
+// Like vehicle_teleport, but also turned the way <like> faces: its rotation (matrix +0x00..+0x2f, swept rotations +0x60 / +0x70)
+// copied, the swept centres of mass put at the same offset from the new position (2026-10-28: the extra AH-1Z faced the other way).
+static int vehicle_teleport_like(char *veh, char *like, const float *to)
+{
+    float *ms = NULL, *mm = NULL;
+    for (int w = 0; w < 2; w++) {
+        char *v = w ? like : veh;
+        char *ph = v && !IsBadReadPtr(v + 0x30, 4) ? *(char **)(v + 0x30) : NULL;
+        char *hb = ph && !IsBadReadPtr(ph + 0xa0, 4) ? *(char **)(ph + 0xa0) : NULL;
+        if (!hb || IsBadReadPtr(hb, 0x100) || *(unsigned *)hb != 0x02738b78) return 0;
+        float *m = *(float **)(hb + 0x18);
+        if ((char *)m != hb + 0xf0 || IsBadWritePtr(m, 0x90)) return 0;
+        if (w) mm = m; else ms = m;
+    }
+    memcpy(ms, mm, 0x30);                       // rotation
+    memcpy(ms + 24, mm + 24, 32);               // swept rotations (quaternions)
+    for (int k = 0; k < 3; k++) {
+        ms[12 + k] = to[k];
+        ms[16 + k] = to[k] + (mm[16 + k] - mm[12 + k]);
+        ms[20 + k] = to[k] + (mm[20 + k] - mm[12 + k]);
+    }
+    return 1;
+}
+// A clear spot beside <veh> for another one like it. The pad: the floor 10 m to its side (ray down - the vehicle itself is in the way
+// at its own centre). A candidate (right / left / behind / ahead, 18 - 45 m) is clear when level rays from the vehicle to it (+2 / +5 m)
+// hit nothing and rays down onto 5 points of the new one's footprint (centre, +-8 m ahead, +-4 m right) all land on that same pad
+// (within 0.4 m): off the pad (Fire from the Sky's floor is a raised platform - 25 m to the right is another, lower one) or anything
+// standing up in the footprint (rocks) is not clear. out = the spot at the vehicle's height. 0 = none found. (2026-10-28: the extra
+// AH-1Z 25 m to the right hit something, fell over and blew up - the mission failed.)
+static int vehicle_clear_spot_tol(char *veh, float *out, float tol)
+{
+    float *x = vehicle_xf(veh);
+    if (!x) return 0;
+    static const float cand[][2] = {{0, -22}, {0, 22}, {18, 0}, {-18, 0}, {0, -30}, {0, 30}, {20, -20}, {-20, -20}, {22, 0}, {-22, 0},
+                                    {20, 20}, {-20, 20}, {0, -40}, {30, 0}, {-30, 0}, {0, 45}};
+    unsigned saved = g_rayFlags;
+    g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+    float pad = 1e9f, hit[3];
+    for (int side = 0; side < 4 && pad > 1e8f; side++) {   // (10 m right / left / behind / ahead: the pad under the vehicle)
+        float dx = side == 0 ? 10.0f : side == 1 ? -10.0f : 0, dz = side == 2 ? -10.0f : side == 3 ? 10.0f : 0, a[3], b[3];
+        for (int k = 0; k < 3; k++) a[k] = b[k] = x[12 + k] + x[k] * dx + x[8 + k] * dz;
+        a[1] = x[13] + 30.0f; b[1] = x[13] - 30.0f;
+        if (ray_cast(a, b, hit, NULL) && hit[1] < x[13] + 0.5f) pad = hit[1];
+    }
+    int found = 0;
+    for (int c = 0; c < (int)(sizeof cand / sizeof cand[0]) && !found && pad < 1e8f; c++) {
+        float p[3];
+        for (int k = 0; k < 3; k++) p[k] = x[12 + k] + x[k] * cand[c][0] + x[8 + k] * cand[c][1];   // (rows: right, up, forward)
+        p[1] = x[13];
+        int blocked = 0;
+        for (int h = 0; h < 2 && !blocked; h++) {
+            float a[3], b[3], len = sqrtf(cand[c][0] * cand[c][0] + cand[c][1] * cand[c][1]);
+            for (int k = 0; k < 3; k++) { b[k] = p[k]; a[k] = x[12 + k] + (p[k] - x[12 + k]) * (8.0f / len); }   // (from 8 m out: not its own hull)
+            a[1] = b[1] = x[13] + (h ? 5.0f : 2.0f);
+            if (ray_cast(a, b, hit, NULL)) blocked = 1;
+        }
+        static const float foot[5][2] = {{0, 0}, {0, 8}, {0, -8}, {4, 0}, {-4, 0}};
+        float top = -1e9f;
+        for (int f = 0; f < 5 && !blocked; f++) {
+            float a[3], b[3];
+            for (int k = 0; k < 3; k++) a[k] = b[k] = p[k] + x[k] * foot[f][0] + x[8 + k] * foot[f][1];
+            a[1] = x[13] + 40.0f; b[1] = x[13] - 30.0f;
+            if (!ray_cast(a, b, hit, NULL) || fabsf(hit[1] - pad) > tol) blocked = 1;
+            else if (hit[1] > top) top = hit[1];
+        }
+        if (!blocked) {   // (as high above the highest point under it as <veh> sits above its own ground - not into a slope)
+            memcpy(out, p, 12);
+            out[1] = top + (x[13] - pad);
+            found = 1;
+            bot_log("coopvehicle: clear spot %d (%.0f m right, %.0f m ahead), ground %.1f (+-%.1f m)", c, cand[c][0], cand[c][1], pad, tol);
+        }
+    }
+    if (!found) bot_log("coopvehicle: no clear spot within +-%.1f m of the ground (%.1f) around the %s", tol, pad, vehicle_name(veh));
+    g_rayFlags = saved;
+    return found;
+}
+// A pad first (+-0.4 m: Fire from the Sky's raised platform), then open ground (+-2 m: the LZ - 2026-10-29, nothing passed at 0.4 there)
+static int vehicle_clear_spot(char *veh, float *out) { return vehicle_clear_spot_tol(veh, out, 0.4f) || vehicle_clear_spot_tol(veh, out, 2.0f); }
+
+// Teleport a vehicle to <pos>, level, turned <yawDeg> (from +z toward +x): the motion state's rotation columns (right, up, forward),
+// swept rotations = the yaw quaternion (x, y, z, w), swept centres of mass from the body's own local centre (+0x80) (2026-10-29: a Huey
+// placed on a mark the user recorded with his Viper - Havok keeps the rotation in the matrix AND the quaternions).
+static int vehicle_teleport_yaw(char *veh, const float *pos, float yawDeg)
+{
+    char *ph = veh && !IsBadReadPtr(veh + 0x30, 4) ? *(char **)(veh + 0x30) : NULL;
+    char *hb = ph && !IsBadReadPtr(ph + 0xa0, 4) ? *(char **)(ph + 0xa0) : NULL;
+    if (!hb || IsBadReadPtr(hb, 0x100) || *(unsigned *)hb != 0x02738b78) return 0;
+    float *ms = *(float **)(hb + 0x18);
+    if ((char *)ms != hb + 0xf0 || IsBadWritePtr(ms, 0x90)) return 0;
+    float t = yawDeg * 3.14159265f / 180.0f, c = cosf(t), sn = sinf(t);
+    float R[3] = {c, 0, -sn}, U[3] = {0, 1, 0}, F[3] = {sn, 0, c};
+    for (int k = 0; k < 3; k++) { ms[k] = R[k]; ms[4 + k] = U[k]; ms[8 + k] = F[k]; }
+    float q[4] = {0, sinf(t / 2), 0, cosf(t / 2)};
+    memcpy(ms + 24, q, 16); memcpy(ms + 28, q, 16);
+    float *lc = ms + 32;   // (centre of mass, body space)
+    for (int k = 0; k < 3; k++) {
+        ms[12 + k] = pos[k];
+        float w = pos[k] + R[k] * lc[0] + U[k] * lc[1] + F[k] * lc[2];
+        ms[16 + k] = w; ms[20 + k] = w;
+    }
+    return 1;
+}
+// BotMod\coop_marks.txt: "<LEVEL> <name> <x> <y> <z> <yaw deg>" - spots recorded in a mission (coopmark / by hand), used by coopplace.
+static int coop_mark_get(const char *name, float *pos, float *yaw)
+{
+    char path[MAX_PATH + 64], l[256], lv[64], nm[64];
+    botmod_file(path, sizeof path, "coop_marks.txt");
+    FILE *f = fopen(path, "r");
+    const char *cur = current_level();
+    int found = 0;
+    if (!f || !cur) { if (f) fclose(f); return 0; }
+    float tp[3], ty;
+    while (fgets(l, sizeof l, f))   // (the last line for it wins - parsed into temporaries: every line used to overwrite pos)
+        if (l[0] != '#' && sscanf(l, "%63s %63s %f %f %f %f", lv, nm, &tp[0], &tp[1], &tp[2], &ty) == 6 && !_stricmp(lv, cur) && !_stricmp(nm, name)) {
+            memcpy(pos, tp, 12); *yaw = ty; found = 1;
+        }
+    fclose(f);
+    return found;
+}
+
+// ---- deathareas off|on (2026-10-28 EXPERIMENT): ServerDeathAreaTriggerEntity::postFrameUpdate 0x00e56770 (thiscall, ret 4; found
+// via its logevent record 0x02c581a0) kills whoever is inside a death area. The user died instantly jumping onto a docked ship
+// outside Noshahr's stock area (a kill plane on out-of-bounds props). "off" = its first 3 bytes (push ebp; mov ebp,esp) become
+// "ret 4": NO death area works anywhere - incl. any kill floor under a map (fall into the void = fall for ever). H->reserved+356.
+#define ADDR_DEATHAREA_UPDATE 0x00e56770
+static const unsigned char kDeathAreaPrologue[3] = {0x55, 0x8B, 0xEC};
+static int *death_areas_off(void) { return (int *)(H->reserved + 356); }
+static int g_daPatched;
+static void death_areas_write(const unsigned char *b)
+{
+    DWORD old;
+    VirtualProtect((void *)ADDR_DEATHAREA_UPDATE, 3, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void *)ADDR_DEATHAREA_UPDATE, b, 3);
+    VirtualProtect((void *)ADDR_DEATHAREA_UPDATE, 3, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_DEATHAREA_UPDATE, 3);
+}
+static void death_areas_tick(void)
+{
+    int want = *death_areas_off() == 1;
+    if (want == g_daPatched) return;
+    if (want) {
+        if (memcmp((void *)ADDR_DEATHAREA_UPDATE, kDeathAreaPrologue, 3) != 0) {
+            bot_log("ERROR: deathareas - bytes mismatch (wrong server build?) - left on"); *death_areas_off() = 0; return;
+        }
+        static const unsigned char ret4[3] = {0xC2, 0x04, 0x00};
+        death_areas_write(ret4);
+        bot_log("deathareas: OFF - no death area kills anyone (kill planes on props AND any kill floor under the map)");
+    } else {
+        death_areas_write(kDeathAreaPrologue);
+        bot_log("deathareas: ON - the game's death areas work again");
+    }
+    g_daPatched = want;
+}
+static void death_areas_unload(void) { if (g_daPatched) { death_areas_write(kDeathAreaPrologue); g_daPatched = 0; } }
+
+// ---- ceiling [m] (2026-10-28): the aircraft altitude ceiling ("molasses" above it) = LevelData.MaxVehicleHeight - a float at
+// LevelData +0x88 (field table 0x02caab98: WorldSizeXZ +0x50, LevelDescription +0x54, ...). The live LevelData = [level +0x24]
+// (level = [ServerGameContext +0x10], its name at data +8). Noshahr 650 m. Whether the client follows the server's value for a
+// human's own aircraft is what "ceiling" is for testing.
+static char *level_data(void)
+{
+    char *ctx = *(char **)ADDR_SERVER_GAME_CONTEXT, *lvl = ctx ? *(char **)(ctx + 0x10) : NULL;
+    char *ld = lvl && !IsBadReadPtr(lvl + 0x24, 4) ? *(char **)(lvl + 0x24) : NULL;
+    if (!ld || IsBadReadPtr(ld, 0x90)) return NULL;
+    const char *nm = *(const char **)(ld + 8);
+    return nm && !IsBadStringPtrA(nm, 64) && !strncmp(nm, "Levels/", 7) ? ld : NULL;
+}
+static void cmd_ceiling(const char *args)
+{
+    char *ld = level_data();
+    if (!ld) { bot_log("ceiling: no level data"); return; }
+    float *mh = (float *)(ld + 0x88), m;
+    if (sscanf(args, "%f", &m) != 1) { bot_log("ceiling: %s MaxVehicleHeight %.0f m (WorldSizeXZ %.0f)", *(const char **)(ld + 8), *mh, *(float *)(ld + 0x50)); return; }
+    if (m < 50 || m > 20000) { bot_log("usage: ceiling [50-20000 m]"); return; }
+    DWORD old;
+    float was = *mh;
+    VirtualProtect(mh, 4, PAGE_READWRITE, &old);
+    *mh = m;
+    VirtualProtect(mh, 4, old, &old);
+    bot_log("ceiling: %s MaxVehicleHeight %.0f -> %.0f m (server only - until the level reloads)", *(const char **)(ld + 8), was, m);
+}
+
+// ---- eventtrace / eventdrop (2026-10-30, co-op mission logic): every output event of a level entity goes through
+// FullEntityBus::internalFireEvent 0x005dbf70 (thiscall bus, args sourceData, EntityEvent* ev - ev+4 = the source event id; ret 8,
+// al = a connection matched): it delivers to server targets AND sends networked ones (types 4/5) to the clients - so dropping an
+// output here stops it everywhere (a door's networked "Close" too). Its first 5 bytes (sub esp,2Ch; push ebx; push ebp) jump to a
+// stub calling on_fire_event(bus, sourceData, ev): eventtrace on [<filter>] logs "type guid event-id"; eventdrop <guid hex prefix>
+// drops every output of that data instance (xor al,al; ret 8). The guid = the data's instance GUID (16 bytes before it when
+// word [data+6] & 0x100), hex in memory order.
+#define ADDR_FIRE_EVENT 0x005dbf70
+static const unsigned char kFireEvent[5] = {0x83, 0xEC, 0x2C, 0x53, 0x55};
+static unsigned char *g_fireStub;
+static int g_fireHooked, g_eventTrace;
+static char g_eventTraceFilter[64];
+static char g_eventDrop[16][40]; static int g_eventDropN;
+static LONG g_eventLogged, g_eventDropped;
+static const char *data_type_name(char *data)
+{
+    if (!data || IsBadReadPtr(data, 8) || IsBadReadPtr(*(void **)data, 4)) return "?";
+    typedef char *(__attribute__((thiscall)) *GetType_t)(void *);
+    unsigned fn = **(unsigned **)data;
+    if (fn < 0x401000 || fn >= 0x02028000) return "?";
+    char *ti = ((GetType_t)fn)(data);
+    char **mi = ti && !IsBadReadPtr(ti, 4) ? *(char ***)ti : NULL;
+    const char *n = mi && !IsBadReadPtr(mi, 4) ? *mi : NULL;
+    return n && !IsBadStringPtrA(n, 64) ? n : "?";
+}
+static void data_guid_hex(char *data, char *out)
+{
+    out[0] = 0;
+    if (!data || IsBadReadPtr(data - 0x10, 0x18) || !(*(unsigned short *)(data + 6) & 0x100)) return;
+    for (int k = 0; k < 16; k++) sprintf(out + 2 * k, "%02x", (unsigned char)data[k - 0x10]);
+}
+// every data instance seen firing, with its bus - "eventfire" fires an output as that data instance (bus->internalFireEvent)
+static char *g_seenData[4096], *g_seenBus[4096]; static int g_seenN;
+// eventchain <src guid prefix> <src event> <ms> <dst guid prefix> <dst event> (2026-10-30, Exfiltration room 1: the door must CLOSE -
+// its "closed" arms the inner door (EventAndGate #11) - but a 3rd player was locked out: 1.5 s after the close Delay 3833e1c2 fires,
+// the door's own open Delay f96d8a0b (same schematic, same type) fires its Out -> "Open" 809571e7 into the door).
+typedef struct EvChain { char src[40], dst[40]; unsigned srcEv, dstEv, ms; char *dstData, *bus; DWORD due; int armed; } EvChain;
+static EvChain g_chain[8]; static int g_chainN;
+int __cdecl on_fire_event(char *bus, char *data, char *ev)
+{
+    if (data && bus) {
+        int k;
+        for (k = 0; k < g_seenN && g_seenData[k] != data; k++) ;
+        if (k == g_seenN && g_seenN < 4096) { g_seenData[g_seenN] = data; g_seenBus[g_seenN] = bus; g_seenN++; }
+        else if (k < g_seenN) g_seenBus[k] = bus;
+    }
+    if (!g_eventTrace && !g_eventDropN && !g_chainN) return 0;
+    char g[40];
+    data_guid_hex(data, g);
+    unsigned id = ev && !IsBadReadPtr(ev, 8) ? *(unsigned *)(ev + 4) : 0;
+    for (int k = 0; k < g_chainN; k++)
+        if (g[0] && id == g_chain[k].srcEv && !strncmp(g, g_chain[k].src, strlen(g_chain[k].src)) && !g_chain[k].armed) {
+            g_chain[k].bus = bus; g_chain[k].due = GetTickCount() + g_chain[k].ms; g_chain[k].armed = 1;
+            if (!g_chain[k].dstData) {   // find the target data instance: its GUID (16 bytes before it) starts with dst, same vtable
+                unsigned char want[16]; int wn = (int)strlen(g_chain[k].dst) / 2;
+                for (int b = 0; b < wn && b < 16; b++) { unsigned v; sscanf(g_chain[k].dst + 2 * b, "%2x", &v); want[b] = (unsigned char)v; }
+                MEMORY_BASIC_INFORMATION mi; char *a = (char *)0x10000;
+                while (!g_chain[k].dstData && (unsigned)a < 0xFFFE0000u && VirtualQuery(a, &mi, sizeof mi)) {
+                    char *base = mi.BaseAddress, *end = base + mi.RegionSize;
+                    if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mi.Protect & PAGE_GUARD))
+                        for (char *p = base; p + 0x20 <= end; p += 4)
+                            if (!memcmp(p, want, wn) && *(unsigned *)(p + 0x10) == *(unsigned *)data && (*(unsigned short *)(p + 0x16) & 0x100)) { g_chain[k].dstData = p + 0x10; break; }
+                    if ((unsigned)end <= (unsigned)a) break;
+                    a = end;
+                }
+                bot_log("eventchain: %s fired - target %s %s", g, g_chain[k].dst, g_chain[k].dstData ? "found" : "NOT found (same type, memory scan)");
+            }
+        }
+    for (int k = 0; k < g_eventDropN; k++)
+        if (g[0] && !strncmp(g, g_eventDrop[k], strlen(g_eventDrop[k]))) {
+            g_eventDropped++;
+            if (g_eventTrace) bot_log("eventdrop: %s %s event %08x DROPPED", data_type_name(data), g, id);
+            return 1;
+        }
+    if (g_eventTrace) {
+        const char *tn = data_type_name(data);
+        if (g_eventTraceFilter[0] && !strstr(tn, g_eventTraceFilter) && strncmp(g, g_eventTraceFilter, strlen(g_eventTraceFilter))) return 0;
+        if (g_eventLogged++ < 20000) bot_log("event: %s %s event %08x", tn, g[0] ? g : "-", id);
+    }
+    return 0;
+}
+static void fire_event_hook(int on)
+{
+    DWORD old;
+    if (on && !g_fireHooked) {
+        if (memcmp((void *)ADDR_FIRE_EVENT, kFireEvent, 5)) { bot_log("ERROR: eventtrace - bytes mismatch at 0x005dbf70"); return; }
+        if (!g_fireStub) g_fireStub = VirtualAlloc(NULL, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *st = g_fireStub; int k = 0, jd;
+        st[k++] = 0x60;                                                        // pushad
+        st[k++] = 0xFF; st[k++] = 0x74; st[k++] = 0x24; st[k++] = 0x28;      // push [esp+28h]  (ev)
+        st[k++] = 0xFF; st[k++] = 0x74; st[k++] = 0x24; st[k++] = 0x28;      // push [esp+28h]  (sourceData)
+        st[k++] = 0x51;                                                        // push ecx        (bus)
+        st[k++] = 0xE8; *(DWORD *)(st + k) = (DWORD)((unsigned char *)on_fire_event - (st + k + 4)); k += 4;
+        st[k++] = 0x83; st[k++] = 0xC4; st[k++] = 0x0C;                      // add esp,0Ch
+        // (the answer stays on this thread's stack - a shared global raced between threads firing events at once: real events
+        //  were dropped at the players' spawn and it crashed, 0x00961498, 2026-10-30; eax is no argument of the thiscall)
+        st[k++] = 0x89; st[k++] = 0x44; st[k++] = 0x24; st[k++] = 0x1C;      // mov [esp+1Ch],eax  (pushad's saved eax)
+        st[k++] = 0x61;                                                        // popad
+        st[k++] = 0x85; st[k++] = 0xC0;                                        // test eax,eax
+        st[k++] = 0x75; jd = k++;                                              // jnz drop
+        memcpy(st + k, kFireEvent, 5); k += 5;                                 // sub esp,2Ch; push ebx; push ebp
+        st[k++] = 0xE9; *(DWORD *)(st + k) = (DWORD)((unsigned char *)ADDR_FIRE_EVENT + 5 - (st + k + 4)); k += 4;
+        st[jd] = (unsigned char)(k - (jd + 1));
+        st[k++] = 0x32; st[k++] = 0xC0;                                        // drop: xor al,al
+        st[k++] = 0xC2; st[k++] = 0x08; st[k++] = 0x00;                        // ret 8
+        FlushInstructionCache(GetCurrentProcess(), st, 128);
+        unsigned char j[5] = {0xE9};
+        *(DWORD *)(j + 1) = (DWORD)(st - ((unsigned char *)ADDR_FIRE_EVENT + 5));
+        VirtualProtect((void *)ADDR_FIRE_EVENT, 5, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_FIRE_EVENT, j, 5);
+        VirtualProtect((void *)ADDR_FIRE_EVENT, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_FIRE_EVENT, 5);
+        g_fireHooked = 1;
+    } else if (!on && g_fireHooked) {
+        VirtualProtect((void *)ADDR_FIRE_EVENT, 5, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_FIRE_EVENT, kFireEvent, 5);
+        VirtualProtect((void *)ADDR_FIRE_EVENT, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_FIRE_EVENT, 5);
+        g_fireHooked = 0;
+    }
+}
+
+// ---- The dynamic-avoidance predictor pool (2026-10-30, co-op with "serveranim on"): every soldier's ServerDynamicAvoidanceEntity
+// (vt 0x025cd3f0, handler 0x00e62bc0) takes a 0x40-byte predictor from the singleton AntCollisionPredictionDedicatedServer ([0x02b47d8c],
+// ctor 0x008c3490: an IndexedObjectPool of 32 slots inline) once its soldier has an Ant animatable - only with the server animation
+// manager on; a slot is freed only when the soldier entity is destroyed. After ~32 AI lives Exfiltration spawned one more: "out of
+// slots" -> int3 0x004c437f (18:04, 21:28). The ctor call at 0x00e62c34 goes through avoid_pool_ctor: the stock ctor, then the
+// (empty) pool re-initialised (0x004ae370 thiscall pool, (storage, bitmap, elemSize, count)) on a static 16-aligned buffer of 1024.
+#define AVOID_POOL_N 1024
+// (VirtualAlloc'd, never freed: a live pool must outlive a BotMod hot reload)
+static unsigned char *g_avoidStore; static unsigned *g_avoidBits;
+static unsigned char g_avoidSaved[5]; static int g_avoidHooked;
+char *__attribute__((fastcall)) avoid_pool_ctor(char *obj, int edx, const char *name, int flag)
+{
+    (void)edx;
+    typedef char *(__attribute__((thiscall)) *Ctor_t)(void *, const char *, int);
+    typedef void (__attribute__((thiscall)) *Init_t)(void *, void *, void *, int, int);
+    ((Ctor_t)0x008c3490)(obj, name, flag);
+    if (!g_avoidStore) { g_avoidStore = VirtualAlloc(NULL, AVOID_POOL_N * 0x40 + AVOID_POOL_N / 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); g_avoidBits = (unsigned *)(g_avoidStore + AVOID_POOL_N * 0x40); }
+    if (!g_avoidStore) return obj;
+    ((Init_t)0x004ae370)(obj + 0x10, g_avoidStore, g_avoidBits, 0x40, AVOID_POOL_N);
+    return obj;
+}
+static int avoid_pool_used(void)
+{
+    char *p = *(char **)0x02b47d8c;
+    if (!p || IsBadReadPtr(p + 0x10, 0x14)) return -1;
+    int n = *(int *)(p + 0x10), words = *(int *)(p + 0x1c), freeN = 0;
+    unsigned *bm = *(unsigned **)(p + 0x20);
+    if (!bm || IsBadReadPtr(bm, words * 4)) return -1;
+    for (int k = 0; k < words; k++) freeN += __builtin_popcount(bm[k]);
+    return n - freeN;
+}
+static void avoid_pool_hook(int on)
+{
+    unsigned char *p = (unsigned char *)0x00e62c34;
+    DWORD old;
+    if (on && !g_avoidHooked) {
+        if (p[0] != 0xE8 || (unsigned)(p + 5 + *(int *)(p + 1)) != 0x008c3490) { bot_log("ERROR: avoid pool - 0x00e62c34 is not call 0x8c3490"); return; }
+        memcpy(g_avoidSaved, p, 5);
+        VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+        *(int *)(p + 1) = (int)((unsigned char *)avoid_pool_ctor - (p + 5));
+        VirtualProtect(p, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+        g_avoidHooked = 1;
+        bot_log("animguard: the avoidance predictor pool gets %d slots instead of 32 (it ran out of slots: 18:04, 21:28)", AVOID_POOL_N);
+    } else if (!on && g_avoidHooked) {
+        VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(p, g_avoidSaved, 5);
+        VirtualProtect(p, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+        g_avoidHooked = 0;
+    }
+}
+
+// ---- Ant "move to target" with no job scheduler (2026-10-30, co-op with "serveranim on"): the FbLoco locomotion scene op
+// (ANT_FbLocoUpdateSceneOp 0xa0a780 -> 0xa0a0e0) builds a MoveToTargetJob (0xbe8460, mode at +0x1450: 0 = async job, 1 = inline) with
+// a hardcoded "push 0" at 0x00a0a081, and its kick 0xbe7930 dispatches it through the Ant job scheduler ([0x284c26c], 0x00961490 at
+// 0x00be79ed) - NULL on the dedicated server (AntSettings.EnableJobs off): ACCESS_VIOLATION at 0x00961498 whenever a soldier played a
+// move-to-target action - getting out of a vehicle (the intro climb-out, the courtyard 21:54). (A) new controllers are built in mode 1
+// (push 1 - the engine's own synchronous path); (B) the dispatch call goes through move_target_spawn: no scheduler -> the job body
+// 0xbe7a30 runs inline and an invalid handle {0x284a944,0,0} is returned (the later wait skips it).
+static int g_moveTargetHooked; static unsigned char g_mtSaved[5];
+void *__attribute__((fastcall)) move_target_spawn(void **sched, void *edx, void *ret, void *desc, void *data, int size, int a, int b)
+{
+    (void)edx;
+    if (sched) {
+        typedef void *(__attribute__((thiscall)) *Spawn_t)(void *, void *, void *, void *, int, int, int);
+        return ((Spawn_t)0x00961490)(sched, ret, desc, data, size, a, b);
+    }
+    ((void (__cdecl *)(void *))0x00be7a30)(data);
+    unsigned *h = ret;
+    h[0] = 0x0284a944; h[1] = 0; h[2] = 0;
+    return ret;
+}
+static void move_target_guard(int on)
+{
+    unsigned char *m = (unsigned char *)0x00a0a081, *c = (unsigned char *)0x00be79ed;
+    DWORD old;
+    if (on && !g_moveTargetHooked) {
+        if (m[0] != 0x6A || (m[1] != 0x00 && m[1] != 0x01) || c[0] != 0xE8 || (unsigned)(c + 5 + *(int *)(c + 1)) != 0x00961490) { bot_log("ERROR: move-to-target guard - bytes mismatch"); return; }
+        VirtualProtect(m, 2, PAGE_EXECUTE_READWRITE, &old); m[1] = 0x01; VirtualProtect(m, 2, old, &old);
+        memcpy(g_mtSaved, c, 5);
+        VirtualProtect(c, 5, PAGE_EXECUTE_READWRITE, &old);
+        *(int *)(c + 1) = (int)((unsigned char *)move_target_spawn - (c + 5));
+        VirtualProtect(c, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), m, 2); FlushInstructionCache(GetCurrentProcess(), c, 5);
+        g_moveTargetHooked = 1;
+        bot_log("animguard: Ant move-to-target jobs run inline (no job scheduler on the dedicated server - the vehicle-exit crash 0x00961498)");
+    } else if (!on && g_moveTargetHooked) {
+        VirtualProtect(m, 2, PAGE_EXECUTE_READWRITE, &old); m[1] = 0x00; VirtualProtect(m, 2, old, &old);
+        VirtualProtect(c, 5, PAGE_EXECUTE_READWRITE, &old); memcpy(c, g_mtSaved, 5); VirtualProtect(c, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), m, 2); FlushInstructionCache(GetCurrentProcess(), c, 5);
+        g_moveTargetHooked = 0;
+    }
+}
+
+// ---- aifire on|off (2026-10-30, co-op AI on the dedicated server: they aim, almost never fire). fb::ai::BehaviourFire::update
+// 0x010e1010 fires only when okToFire 0x010cf980 passes - which fails while the bot has a move request whose path never finishes
+// (the AI cannot walk here yet: every order stays "moving") unless the stance's move style allows firing (je at 0x010cfa8a) - and
+// when its short line-of-fire raycast reports blocked (cmp [esi+268h],1 / je at 0x010e178a). Both "je" (0F 84 rel32) become 6 NOPs.
+// (2026-10-30 aifirediag: "aimed at target" 0x010df6a0 said NO on every check (38/38, state ready) - its "jbe -> false" after the
+//  dot(aim dir, weapon forward) > tolerance compare at 0x010df8a8 (0F 86 rel32) is NOP'd too: the AI counts as aimed.)
+// (2026-11-02: the line-of-fire raycast block 0x010e178a is NOT bypassed any more - with aiaim the AI killed players through walls,
+//  "a ghost")
+static const unsigned g_aiFireJe[2] = {0x010cfa8a, 0x010df8a8};
+static unsigned char g_aiFireSaved[3][6];
+static int g_aiFire;
+static void ai_fire(int on)
+{
+    if (on == g_aiFire) return;
+    for (int k = 0; k < 2; k++) {
+        unsigned char *p = (unsigned char *)g_aiFireJe[k];
+        if (on && (p[0] != 0x0F || (p[1] != 0x84 && p[1] != 0x86))) { bot_log("ERROR: aifire - %p is not je rel32 (%02x %02x)", p, p[0], p[1]); return; }
+    }
+    for (int k = 0; k < 2; k++) {
+        unsigned char *p = (unsigned char *)g_aiFireJe[k];
+        DWORD old;
+        VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
+        if (on) { memcpy(g_aiFireSaved[k], p, 6); memset(p, 0x90, 6); } else memcpy(p, g_aiFireSaved[k], 6);
+        VirtualProtect(p, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+    }
+    g_aiFire = on;
+    bot_log("aifire: %s", on ? "ON - mission AI may fire while a move order is pending and through its short line-of-fire check" : "OFF");
+}
+
+// ---- aifirediag on|off|show (2026-10-30): which condition of fb::ai::BehaviourFire::update 0x010e1010 stops the mission AI
+// firing. Its calls are routed through counting wrappers (call rel32 retargeted, same conventions): fire state 0x010c8500 (thiscall,
+// 0 ready / 1 busy / 2 no ammo / 3 no weapon) at 0x010e137d; vehicle-aim 0x010e52a0 (cdecl bot) at 0x010e1559; aimed-at-target
+// 0x010df6a0 (thiscall) at 0x010e156b; okToFire 0x010cf980 (thiscall, 1 arg) at 0x010e161c; fire 0x010cfac0 (thiscall, 1 arg) at
+// 0x010e13b3 / 0x010e17c3. "show" (and every 10 s while on) logs the counts since the last show.
+static volatile LONG g_fdState[4], g_fdVeh[2], g_fdAim[2], g_fdOk[2], g_fdFire, g_fdUpdates;
+int __attribute__((fastcall)) fd_state(void *t, void *edx) { (void)edx; int r = ((int (__attribute__((thiscall)) *)(void *))0x010c8500)(t); if (r >= 0 && r < 4) g_fdState[r]++; return r; }
+int __cdecl fd_veh(void *bot) { int r = ((int (__cdecl *)(void *))0x010e52a0)(bot); g_fdVeh[(r & 0xff) != 0]++; return r; }
+int __attribute__((fastcall)) fd_aim(void *t, void *edx) { (void)edx; int r = ((int (__attribute__((thiscall)) *)(void *))0x010df6a0)(t); g_fdAim[(r & 0xff) != 0]++; return r; }
+int __attribute__((fastcall)) fd_ok(void *t, void *edx, int a) { (void)edx; int r = ((int (__attribute__((thiscall)) *)(void *, int))0x010cf980)(t, a); g_fdOk[(r & 0xff) != 0]++; return r; }
+static volatile LONG g_fdUpd[4];
+int __attribute__((fastcall)) fd_update(void *t, void *edx) { (void)edx; int r = ((int (__attribute__((thiscall)) *)(void *))0x010e1010)(t); g_fdUpd[r & 3]++; return r; }
+int __attribute__((fastcall)) fd_fire(void *t, void *edx, int a) { (void)edx; g_fdFire++; return ((int (__attribute__((thiscall)) *)(void *, int))0x010cfac0)(t, a); }
+static const struct { unsigned site, target; void *wrap; } kFd[7] = {
+    {0x010e1c43, 0x010e1010, (void *)fd_update},
+    {0x010e137d, 0x010c8500, (void *)fd_state}, {0x010e1559, 0x010e52a0, (void *)fd_veh}, {0x010e156b, 0x010df6a0, (void *)fd_aim},
+    {0x010e161c, 0x010cf980, (void *)fd_ok}, {0x010e13b3, 0x010cfac0, (void *)fd_fire}, {0x010e17c3, 0x010cfac0, (void *)fd_fire}};
+static int g_fireDiag; static DWORD g_fdShownAt;
+static void fire_diag_show(void)
+{
+    { extern unsigned g_hcBlocked, g_hcBotPass; extern volatile LONG g_dmgCalls, g_dmgHuman;
+      extern volatile LONG g_aiHits;
+      bot_log("aifirediag: damage - AI bullet hits %ld | soldier onDamage %ld (on humans %ld) | health-component gate: passed %u blocked %u", g_aiHits, g_dmgCalls, g_dmgHuman, g_hcBotPass, g_hcBlocked);
+      g_aiHits = 0; g_dmgCalls = g_dmgHuman = 0; g_hcBotPass = g_hcBlocked = 0; }
+    bot_log("aifirediag: aistep - %ld AI character steps, %ld times an AI was left to the engine | aimove steering inputs %ld", g_aiStepped, g_aiStepSkip0, g_aiMoveSteered);
+    g_aiMoveSteered = 0;
+    g_aiStepped = g_aiStepSkip0 = 0;
+    bot_log("aifirediag: BehaviourFire::update calls -> wait %ld done %ld fail %ld", g_fdUpd[0], g_fdUpd[1], g_fdUpd[2]);
+    g_fdUpd[0] = g_fdUpd[1] = g_fdUpd[2] = g_fdUpd[3] = 0;
+    bot_log("aifirediag: state ready %ld busy %ld noammo %ld noweapon %ld | vehicle-aim yes %ld no %ld | aimed yes %ld no %ld | okToFire yes %ld no %ld | FIRE %ld",
+            g_fdState[0], g_fdState[1], g_fdState[2], g_fdState[3], g_fdVeh[1], g_fdVeh[0], g_fdAim[1], g_fdAim[0], g_fdOk[1], g_fdOk[0], g_fdFire);
+    for (int k = 0; k < 4; k++) g_fdState[k] = 0;
+    g_fdVeh[0] = g_fdVeh[1] = g_fdAim[0] = g_fdAim[1] = g_fdOk[0] = g_fdOk[1] = 0; g_fdFire = 0;
+    g_fdShownAt = GetTickCount();
+}
+static void fire_diag(int on)
+{
+    if (on == g_fireDiag) return;
+    for (int k = 0; k < 7; k++) {
+        unsigned char *p = (unsigned char *)kFd[k].site;
+        unsigned want = on ? kFd[k].target : (unsigned)kFd[k].wrap;
+        if (p[0] != 0xE8 || (unsigned)(p + 5 + *(int *)(p + 1)) != want) { bot_log("ERROR: aifirediag - %p is not call %08x", p, want); return; }
+    }
+    for (int k = 0; k < 7; k++) {
+        unsigned char *p = (unsigned char *)kFd[k].site;
+        unsigned to = on ? (unsigned)kFd[k].wrap : kFd[k].target;
+        DWORD old;
+        VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+        *(int *)(p + 1) = (int)(to - (unsigned)(p + 5));
+        VirtualProtect(p, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+    }
+    g_fireDiag = on;
+    if (on) fire_diag_show();
+    bot_log("aifirediag: %s", on ? "ON - counts every 10 s" : "OFF");
+}
+
+// ---- aiaim on|off (2026-10-30, co-op AI: aims, never fires). aimedAtTarget 0x010df6a0 (thiscall, returns al), for an AI with an
+// aim controller ([this+0xb]&1), is just "[[bot+0x6cc]] != 0 && == ctrl.token" - a "requested aim reached" token the soldier's aim
+// component (vt 0x02653800) gets back through Ant, which never happens on this server (aifirediag: aimed NO 38/38). The function is
+// detoured: target + aim set -> true, m_currentAimDir (this+0x50) = normalized (aimer target point +0xa0 - aimer origin +0x20) and
+// byte this+0x1a4 = 1; fire 0x010cfac0 then takes its aim-direction override (the two "skip to the weapon's own transform" jumps
+// 0x010cfcc7 jne / 0x010cfcd4 jbe become NOPs) - the shot goes toward the target, not where the (frozen) soldier faces.
+static unsigned char *g_aimTramp; static int g_aiAim; static unsigned char g_aimSaved[3][6];
+static volatile LONG g_aimForced, g_aimWalled, g_aimWallLog, g_aimTurning;
+static int g_aimRecompute;   // aiaim recompute on|off: m_currentAimDir from (aimer+0xa0 - aimer+0x20) - off: the aimer's own direction
+                             // (with it on 21 shots / 10 s did no damage at all: no onDamage - the guessed origin may be wrong)
+char __attribute__((fastcall)) ai_aimed_hook(unsigned char *self, void *edx)
+{
+    unsigned *h = *(unsigned **)(self + 0x24);
+    if (!h || !*h || *h == 4) return 0;
+    if (!self[0x60]) return 0;
+    if (!(self[0xb] & 1)) return ((char (__attribute__((fastcall)) *)(void *, void *))g_aimTramp)(self, edx);
+    unsigned char *aimer = *(unsigned char **)(self + 0x48);
+    if (g_aimRecompute && aimer && !IsBadReadPtr(aimer, 0xb0)) {
+        float *org = (float *)(aimer + 0x20), *tgt = (float *)(aimer + 0xa0);
+        float d0 = tgt[0] - org[0], d1 = tgt[1] - org[1], d2 = tgt[2] - org[2], l2 = d0 * d0 + d1 * d1 + d2 * d2;
+        if (l2 > 1e-4f && l2 < 1e12f) {
+            float inv = 1.0f / sqrtf(l2), *cur = (float *)(self + 0x50);
+            cur[0] = d0 * inv; cur[1] = d1 * inv; cur[2] = d2 * inv; cur[3] = 0.0f;
+        }
+    }
+    {   // (2026-11-02: a shotgunner in a bathroom kept hitting a player through its wall - the engine's own line-of-fire check only
+        //  looks ~5 m: no clear line from the shooter's head (its soldier +1.5 m) to the aim point (aimer+0xa0) -> not aimed, no shot)
+        char *bot = *(char **)(self + 4), *pref = bot && !IsBadReadPtr(bot + 0x320, 4) ? *(char **)(bot + 0x320) : NULL;
+        char *pl = pref && !IsBadReadPtr(pref, 4) && *(char **)pref ? *(char **)pref - 8 : NULL;
+        char *so = pl && !IsBadReadPtr(pl + OFF_PLAYER_SOLDIER, 4) ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+        if (so && aimer && !IsBadReadPtr(so + OFF_SOLDIER_SPAWN_POSITION, 12) && !IsBadReadPtr(aimer + 0xa0, 12)) {
+            float *sp = (float *)(so + OFF_SOLDIER_SPAWN_POSITION), *tp = (float *)(aimer + 0xa0);
+            float eye[3] = {sp[0], sp[1] + 1.5f, sp[2]}, hit[3];
+            {   // (2026-11-03: an AI fired a shotgun burst into a prop 5 m to its west - the player was east - and blew itself up: the
+                //  shot goes where the body faces. Aimed only once the body faces within ~20 deg of the aim point; the engine's
+                //  own aim input turns it meanwhile.)
+                float fx = tp[0] - sp[0], fz = tp[2] - sp[2];
+                if (fx * fx + fz * fz > 0.25f) {
+                    float y = *(float *)(so + OFF_SOLDIER_YAW), t = fmodf(yaw_towards(fx, fz), 6.2831853f);
+                    if (t > 0) t -= 6.2831853f;
+                    float up = t - y, down = up > 0 ? y - t + 6.2831853f : y - t, err = (up > 0 && up < down) ? up : -down;
+                    while (err > 3.14159265f) err -= 6.2831853f;
+                    while (err < -3.14159265f) err += 6.2831853f;
+                    if (fabsf(err) > 0.35f) { g_aimTurning++; return 0; }
+                }
+            }
+            float dx = tp[0] - eye[0], dy = tp[1] - eye[1], dz = tp[2] - eye[2], d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > 1.0f && d < 400.0f) {
+                float to[3] = {tp[0] - dx / d * 0.5f, tp[1] - dy / d * 0.5f, tp[2] - dz / d * 0.5f};   // (stop short of the target body)
+                unsigned saved = g_rayFlags;
+                g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+                int blocked = ray_cast(eye, to, hit, NULL);
+                g_rayFlags = saved;
+                if (blocked) {
+                    g_aimWalled++;
+                    if (g_aimWallLog < 8 && InterlockedIncrement(&g_aimWallLog) <= 8)
+                        bot_log("aiaim: %s held back - eye (%.1f %.1f %.1f) -> aim point (%.1f %.1f %.1f) %.0f m, wall at (%.1f %.1f %.1f)",
+                                pl + OFF_PLAYER_ONLINE_NAME, eye[0], eye[1], eye[2], tp[0], tp[1], tp[2], d, hit[0], hit[1], hit[2]);
+                    return 0;
+                }
+            }
+        }
+    }
+    self[0x1a4] = 1;
+    g_aimForced++;
+    return 1;
+}
+static void ai_aim(int on)
+{
+    static const unsigned va[3] = {0x010df6a0, 0x010cfcc7, 0x010cfcd4};
+    static const unsigned char orig0[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0};
+    if (on == g_aiAim) return;
+    if (on) {
+        if (memcmp((void *)va[0], orig0, 6) || ((unsigned char *)va[1])[0] != 0x0F || ((unsigned char *)va[1])[1] != 0x85
+            || ((unsigned char *)va[2])[0] != 0x0F || ((unsigned char *)va[2])[1] != 0x86) { bot_log("ERROR: aiaim - bytes mismatch"); return; }
+        if (!g_aimTramp) g_aimTramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        memcpy(g_aimTramp, orig0, 6);
+        g_aimTramp[6] = 0xE9; *(int *)(g_aimTramp + 7) = (int)(0x010df6a6 - (unsigned)(g_aimTramp + 11));
+        FlushInstructionCache(GetCurrentProcess(), g_aimTramp, 16);
+    }
+    for (int k = 0; k < 3; k++) {
+        unsigned char *p = (unsigned char *)va[k], b[6];
+        DWORD old;
+        if (on) {
+            memcpy(g_aimSaved[k], p, 6);
+            if (k == 0) { b[0] = 0xE9; *(int *)(b + 1) = (int)((unsigned char *)ai_aimed_hook - (p + 5)); b[5] = 0x90; }
+            else memset(b, 0x90, 6);
+        } else memcpy(b, g_aimSaved[k], 6);
+        VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy(p, b, 6);
+        VirtualProtect(p, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+    }
+    g_aiAim = on;
+    bot_log("aiaim: %s", on ? "ON - mission AI count as aimed when they have a target and aim at its point (shots go toward it)" : "OFF");
+}
+
+// ---- aieye on|off (2026-10-30, AI only since 2026-11-02): a soldier's eye position 0x008a70e0 (thiscall, esi = this; its shoot space
+// origin = where its bullets start, and AI vision) comes from its camera component when aiming vt[0xc] says so - an Ant camera-bone
+// eye the dedicated server never updates (guess: the AI's bullets start in the wrong place). The first version NOP'd the "jne" at
+// 0x008a7126 for EVERY soldier - the humans' eye moved too and the doors' "E" interaction prompts never showed (2026-11-02). Now the
+// 9 bytes at 0x008a711f (mov edx,[eax+0Ch]; call edx; test al,al; jne 0x008a713d) jump to a stub: camera eye wanted AND "this" is
+// an AI soldier's (ai_eye_this: this - 0x160 is a soldier of an AI player, or this is) -> the physics eye path 0x008a7128 instead.
+static int g_aiEye; static unsigned char *g_eyeStub; static unsigned char g_eyeSaved[9];
+int __cdecl ai_eye_this(char *t)
+{
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *p = arr[k];
+        if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p)) continue;
+        char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+        if (so && (t == so + 0x160 || t == so)) return 1;
+    }
+    return 0;
+}
+static void ai_eye(int on)
+{
+    unsigned char *p = (unsigned char *)0x008a711f;
+    static const unsigned char orig[9] = {0x8B, 0x50, 0x0C, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x15};
+    DWORD old;
+    if (on == g_aiEye) return;
+    if (on) {
+        if (memcmp(p, orig, 9)) { bot_log("ERROR: aieye - bytes mismatch at 0x008a711f"); return; }
+        if (!g_eyeStub) g_eyeStub = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *st = g_eyeStub; int k = 0, jz, jnz;
+        memcpy(st + k, orig, 7); k += 7;                                   // mov edx,[eax+0Ch]; call edx; test al,al
+        st[k++] = 0x74; jz = k++;                                           // jz phys (camera eye not wanted)
+        st[k++] = 0x60;                                                     // pushad
+        st[k++] = 0x56;                                                     // push esi
+        st[k++] = 0xE8; *(DWORD *)(st + k) = (DWORD)((unsigned char *)ai_eye_this - (st + k + 4)); k += 4;
+        st[k++] = 0x83; st[k++] = 0xC4; st[k++] = 0x04;                   // add esp,4
+        st[k++] = 0x89; st[k++] = 0x44; st[k++] = 0x24; st[k++] = 0x1C;   // mov [esp+1Ch],eax
+        st[k++] = 0x61;                                                     // popad
+        st[k++] = 0x85; st[k++] = 0xC0;                                     // test eax,eax
+        st[k++] = 0x75; jnz = k++;                                          // jnz phys (an AI soldier)
+        st[k++] = 0xE9; *(DWORD *)(st + k) = (DWORD)((unsigned char *)0x008a713d - (st + k + 4)); k += 4;   // camera eye
+        st[jz] = (unsigned char)(k - (jz + 1)); st[jnz] = (unsigned char)(k - (jnz + 1));
+        st[k++] = 0xE9; *(DWORD *)(st + k) = (DWORD)((unsigned char *)0x008a7128 - (st + k + 4)); k += 4;   // phys: physics eye
+        FlushInstructionCache(GetCurrentProcess(), st, 64);
+        memcpy(g_eyeSaved, p, 9);
+        unsigned char j[9] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(st - (p + 5));
+        VirtualProtect(p, 9, PAGE_EXECUTE_READWRITE, &old); memcpy(p, j, 9); VirtualProtect(p, 9, old, &old);
+    } else {
+        VirtualProtect(p, 9, PAGE_EXECUTE_READWRITE, &old); memcpy(p, g_eyeSaved, 9); VirtualProtect(p, 9, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), p, 9);
+    g_aiEye = on;
+    bot_log("aieye: %s", on ? "ON - the mission AI's eye / bullet origin = its character physics eye (humans unchanged)" : "OFF");
+}
+
+// ---- aistep on|off (2026-10-30, co-op AI never walk or turn): a soldier moves only when CharacterPhysics::step(dt) 0x00624460
+// (thiscall charPhys = soldier+0x1d4, float dt, ret 4) runs - from singleStep (human connections, BotMod's bots) or from the physics
+// world loop 0x00676880 for characters with byte charPhys+0xfe == 0. The soldier ctor sets +0xfe = isSingleStepped (0x00e07c80, 0
+// for AI) BEFORE its player is set - so an AI soldier is marked single-stepped, the world loop skips it and nothing steps it. The
+// engine still applies its input before physics and its postStep after: only the step is missing. Each frame, every AI player's
+// soldier (player+0x318, on foot: player+0x3e8 == soldier, charPhys+0xfe set) is stepped with the frame dt.
+static void ai_step_tick(void)
+{
+    static LARGE_INTEGER last, fq;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+    float dt = last.QuadPart ? (float)(now.QuadPart - last.QuadPart) / (float)fq.QuadPart : 1.0f / 30.0f;
+    last = now;
+    if (!g_aiStep) return;
+    if (dt <= 0.0f) return;
+    if (dt > 0.1f) dt = 0.1f;
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    typedef void (__attribute__((thiscall)) *CharStep_t)(void *cp, float dt);
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *p = arr[k];
+        if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p)) continue;
+        char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+        if (!so || *(char **)(p + 0x3e8) != so || !*(void **)(p + OFF_PLAYER_INPUT)) continue;
+        char *cp = !IsBadReadPtr(so + 0x1d4, 4) ? *(char **)(so + 0x1d4) : NULL;
+        if (!cp || IsBadReadPtr(cp + 0xfe, 1)) continue;
+        if (!cp[0xfe]) { g_aiStepSkip0++; continue; }   // (the engine steps it)
+        if (g_aiStep == 2) {   // "aistep single": the soldier's own singleStep (vt 0x140, entry 0) like BotMod's bots - applies the
+            // player's EntryInput (the aimove throttle / yaw) and steps; plain CharacterPhysics::step moved nothing (2026-11-02)
+            typedef void (__attribute__((thiscall)) *SingleStep2_t)(void *soldier, int entry);
+            ((SingleStep2_t)(*(void ***)so)[0x140 / 4])(so, 0);
+        } else ((CharStep_t)0x00624460)(cp, dt);
+        if (so[0x249] && g_aiSyncXf) {   // (physics-controlled AI: the transform never followed the simulated body - the AI's own loco and
+            // the clients saw them standing still; its translation (+0x4b0) is set to the simulated position, 2026-11-02)
+            float *sim = (float *)(so + OFF_SOLDIER_POSITION), *xf = (float *)(so + OFF_SOLDIER_SPAWN_POSITION);
+            if (sim[0] == sim[0] && (sim[0] != 0 || sim[2] != 0)) { xf[0] = sim[0]; xf[1] = sim[1]; xf[2] = sim[2]; }
+        }
+        g_aiStepped++;
+    }
+}
+
+// ---- aimove on|off (2026-11-02, co-op AI move animation-driven: on the dedicated server the Ant root motion is never applied - the
+// clients see them walk, the server never moves them: ghosts, shots through walls, the defector teleported). The AI's own plan is
+// readable (scratchpad\aimove): BotManager [0x2bdac28] bots; PathFollower pf = [bot+0x3b0]; loco = [pf+8]-0x20 when [[pf+8]] ==
+// 0x025c5d48 (ServerAILocoComponent's MovementController); current task [loco+0x4ac] (vt Move 0x024dd608 / Cover 0x024dd638 / Vault
+// 0x024dc890 / Scenario 0x024ddac0): target +0x30, arrival radius +0x1c; loco+0x210 = where the loco sees its soldier. BotMod steers
+// the soldier there like its own bots: the bot input fill 0x01b834a0 clears + refills the bot's EntryInput (esi = bot+0x3c0) and
+// copies it to the player's - a hook right after the controller fill (0x01b83552: cmp byte [edi+0x6c6],0; 7 bytes) adds throttle /
+// yaw. The soldier (stepped by aistep) then really walks; the MoveTask's own arrival test is position-based.
+// ---- aimove routes (2026-11-03): straight-line steering left every AI with a wall between it and its order stuck (Exodus: a
+// dozen inside a building). Each steered AI gets a route on BotMod's nav grid (nav_find_path) from where it stands to the order's
+// target, re-planned when the target changes or it strays; the steering then heads for the next waypoint.
+#define AIR_PTS 64
+typedef struct AiRoute { char *loco; float gx, gz, pts[AIR_PTS * 3]; int cnt, next; DWORD used, planned; } AiRoute;
+static AiRoute g_aiRoute[64]; static volatile LONG g_aiRoutePlans, g_aiRouteFails;
+static AiRoute *ai_route_slot(char *loco)
+{
+    AiRoute *old = &g_aiRoute[0];
+    for (int k = 0; k < 64; k++) { if (g_aiRoute[k].loco == loco) return &g_aiRoute[k]; if (g_aiRoute[k].used < old->used) old = &g_aiRoute[k]; }
+    memset(old, 0, sizeof *old); old->loco = loco; old->gx = old->gz = -1e9f;
+    return old;
+}
+// The point to steer for: the next waypoint of the AI's route to (tx, tz), or the target itself (no grid / no route).
+static void ai_route_aim(char *loco, const float *pos, const float *tp, float *ax, float *az)
+{
+    *ax = tp[0]; *az = tp[2];
+    NavGrid *g = *nav_slot();
+    if (!g || g->phase != 2) return;
+    AiRoute *r = ai_route_slot(loco);
+    DWORD now = GetTickCount();
+    r->used = now;
+    int stray = r->cnt && r->next < r->cnt && fabsf(r->pts[r->next * 3] - pos[0]) + fabsf(r->pts[r->next * 3 + 2] - pos[2]) > 25.0f;
+    if ((fabsf(r->gx - tp[0]) > 0.5f || fabsf(r->gz - tp[2]) > 0.5f || stray) && now - r->planned > 1000) {
+        r->planned = now; r->gx = tp[0]; r->gz = tp[2]; r->next = 0;
+        r->cnt = nav_find_path(g, ray_cast, pos[0], pos[1], pos[2], tp[0], tp[1], tp[2], r->pts, AIR_PTS);
+        if (r->cnt > 0) g_aiRoutePlans++;
+        else {
+            g_aiRouteFails++; r->cnt = 0;
+            if (strstr(nav_last_error(), "no start")) nav_grow_to(pos);   // (off the grid: a bigger one, built in the background)
+        }
+    }
+    if (!r->cnt) return;
+    while (r->next < r->cnt - 1) {   // (waypoint reached, or the one after it in plain sight: on to the next)
+        float dx = r->pts[r->next * 3] - pos[0], dz = r->pts[r->next * 3 + 2] - pos[2];
+        if (dx * dx + dz * dz < 1.2f * 1.2f) { r->next++; continue; }
+        float feet[3] = {pos[0], pos[1], pos[2]};
+        if (dx * dx + dz * dz < 4.0f * 4.0f && nav_segment_clear(ray_cast, feet, &r->pts[(r->next + 1) * 3])) { r->next++; continue; }
+        break;
+    }
+    if (r->next < r->cnt - 1) { *ax = r->pts[r->next * 3]; *az = r->pts[r->next * 3 + 2]; }
+}
+
+static unsigned char *g_moveStub; static unsigned char g_moveSaved[7];
+void __cdecl ai_move_input(char *bot, char *in)
+{
+    if (!g_aiMove || !bot || !in || IsBadReadPtr(bot, 0x6d0)) return;
+    char *pf = *(char **)(bot + 0x3b0);
+    if (!pf || IsBadReadPtr(pf, 0x40)) return;
+    char *mc = *(char **)(pf + 8);
+    if (!mc || IsBadReadPtr(mc, 4) || *(unsigned *)mc != 0x025c5d48) return;
+    char *loco = mc - 0x20;
+    if (IsBadReadPtr(loco, 0x5a0)) return;
+    {   // (physics-controlled AI: the entity's own transform - what the loco (0x00e2805a..0x00e28080: [[[loco+8]]+0x1c], an indexed
+        //  matrix when bit 0x12 of +8 is set; translation +0x30) and the clients see - follows the simulated body, 2026-11-02)
+        char *pref0 = *(char **)(bot + 0x320), *pl0 = pref0 && !IsBadReadPtr(pref0, 4) && *(char **)pref0 ? *(char **)pref0 - 8 : NULL;
+        char *so0 = pl0 && !IsBadReadPtr(pl0 + OFF_PLAYER_SOLDIER, 4) ? *(char **)(pl0 + OFF_PLAYER_SOLDIER) : NULL;
+        char *e = *(char **)(loco + 8), *sx = e && !IsBadReadPtr(e, 4) ? *(char **)e : NULL;
+        if (so0 && so0[0x249] && sx && !IsBadReadPtr(sx, 0x20) && !player_vehicle(pl0)) {
+            char *m = *(char **)(sx + 0x1c);
+            if (m && ((*(unsigned *)(sx + 8) >> 0x12) & 1)) m = m + 0x10 + 0x50 * *(unsigned char *)(m + 6);
+            float *sim = (float *)(so0 + OFF_SOLDIER_POSITION);
+            if (m && !IsBadWritePtr(m + 0x30, 12) && sim[0] == sim[0] && (sim[0] != 0 || sim[2] != 0)) {
+                float *tr = (float *)(m + 0x30);
+                tr[0] = sim[0]; tr[1] = sim[1]; tr[2] = sim[2];
+            }
+        }
+    }
+    char *task = *(char **)(loco + 0x4ac);
+    if (!task || IsBadReadPtr(task, 0x70)) return;
+    unsigned tvt = *(unsigned *)task;
+    if (tvt != 0x024dd608 && tvt != 0x024dd638 && tvt != 0x024dc890 && tvt != 0x024ddac0) return;
+    char *pref = *(char **)(bot + 0x320), *pl = pref && !IsBadReadPtr(pref, 4) && *(char **)pref ? *(char **)pref - 8 : NULL;
+    char *so = pl && !IsBadReadPtr(pl + OFF_PLAYER_SOLDIER, 4) ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+    if (!so || IsBadReadPtr(so + 0x4c0, 4) || player_vehicle(pl)) return;
+    // (the simulated position: physics-controlled AI (aiphys) move there - the transform +0x4b0 stayed put, they overshot, 2026-11-02)
+    float *tp = (float *)(task + (tvt == 0x024ddac0 ? 0x40 : 0x30)), *pos = so[0x249] ? (float *)(so + OFF_SOLDIER_POSITION) : (float *)(so + OFF_SOLDIER_SPAWN_POSITION);
+    if (tp[0] < -40000.0f || tp[0] != tp[0]) return;   // ("unspecified" -44444)
+    float dx = tp[0] - pos[0], dz = tp[2] - pos[2], d = sqrtf(dx * dx + dz * dz), r = *(float *)(task + 0x1c);
+    if (r < 0.3f || r != r) r = 0.3f;
+    if (d <= r) return;   // there: the task's own arrival test does the rest
+    {   // (the route's next waypoint - see ai_route_aim)
+        float ax, az;
+        ai_route_aim(loco, pos, tp, &ax, &az);
+        dx = ax - pos[0]; dz = az - pos[2];
+    }
+    float y = *(float *)(so + OFF_SOLDIER_YAW), t = fmodf(yaw_towards(dx, dz), 6.2831853f);
+    if (t > 0) t -= 6.2831853f;
+    float up = t - y, down = up > 0 ? y - t + 6.2831853f : y - t, err = (up > 0 && up < down) ? up : -down;
+    // (gait, scratchpad\remoteloco: AntSpeedLevel task+0xc, 13 = NoChange -> the loco's networked default +0x284; 0 Still,
+    //  1 Walk, 3 Sneak, 6/7 stairs walk -> walking pace, the rest run)
+    int lvl = *(int *)(task + 0xc);
+    if (lvl == 13 || lvl < 0 || lvl > 13) lvl = *(int *)(loco + 0x284);
+    float pace = lvl == 0 ? 0.0f : (lvl == 1 || lvl == 3 || lvl == 6 || lvl == 7) ? 0.35f : 0.8f;
+    float thr = fabsf(err) < 0.6f ? (d < 2.0f ? fminf(pace, 0.4f) : pace) : 0.0f;
+    typedef void (__attribute__((thiscall)) *SetLevel_t2)(void *, int, float);
+    ((SetLevel_t2)ADDR_ENTRYINPUT_SET_LEVEL)(in, EIA_THROTTLE, thr);
+    ((SetLevel_t2)ADDR_ENTRYINPUT_SET_LEVEL)(in, EIA_YAW, fmaxf(-1.0f, fminf(1.0f, -err * 2.0f)));
+    g_aiMoveSteered++;
+}
+static void ai_move(int on)
+{
+    unsigned char *p = (unsigned char *)0x01b83552;
+    static const unsigned char orig[7] = {0x80, 0xBF, 0xC6, 0x06, 0x00, 0x00, 0x00};
+    DWORD old;
+    if (on == g_aiMove) return;
+    if (on) {
+        if (memcmp(p, orig, 7)) { bot_log("ERROR: aimove - bytes mismatch at 0x01b83552"); return; }
+        if (!g_moveStub) g_moveStub = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *st = g_moveStub; int k = 0;
+        st[k++] = 0x60;                                                     // pushad
+        st[k++] = 0x56; st[k++] = 0x57;                                     // push esi (input); push edi (bot)
+        st[k++] = 0xE8; *(DWORD *)(st + k) = (DWORD)((unsigned char *)ai_move_input - (st + k + 4)); k += 4;
+        st[k++] = 0x83; st[k++] = 0xC4; st[k++] = 0x08;                   // add esp,8
+        st[k++] = 0x61;                                                     // popad
+        memcpy(st + k, orig, 7); k += 7;                                    // cmp byte [edi+6c6h],0
+        st[k++] = 0xE9; *(DWORD *)(st + k) = (DWORD)((unsigned char *)0x01b83559 - (st + k + 4)); k += 4;
+        FlushInstructionCache(GetCurrentProcess(), st, 64);
+        memcpy(g_moveSaved, p, 7);
+        unsigned char j[7] = {0xE9, 0, 0, 0, 0, 0x90, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(st - (p + 5));
+        VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &old); memcpy(p, j, 7); VirtualProtect(p, 7, old, &old);
+    } else {
+        VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &old); memcpy(p, g_moveSaved, 7); VirtualProtect(p, 7, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), p, 7);
+    g_aiMove = on;
+    bot_log("aimove: %s", on ? "ON - the mission AI are steered (throttle / yaw) to their own move task's target" : "OFF");
+}
+
+// ---- aiphys on|off|convert (2026-11-02): AI soldiers stood still under any input - the AISoldier blueprint has
+// SoldierEntityData.PhysicsControlled (+0x113) = 0: the soldier ctor 0x00e104b0 copies it to soldier+0x249, the spawn init
+// (0x00e0eb10) then gives its CharacterPhysics a keyframed body (cp+0xe0) and CharacterPhysics::step 0x00624460 returns at once
+// (cp+0x78 bit 2 clear) - the physics just follows the transform, which only animation moves. "on": the ctor's
+// "movzx eax,[edi+113h]" at 0x00e10a26 becomes "mov eax,1" - new AI soldiers are physics-controlled like players (input moves them).
+// "convert": soldiers that already exist - their keyframed body is taken out of the world and cp+0x78 bit 2 set (0x0061a200).
+static int g_aiPhys; static unsigned char g_aiPhysSaved[7];
+static void ai_phys(int on)
+{
+    unsigned char *p = (unsigned char *)0x00e10a26;
+    static const unsigned char orig[7] = {0x0F, 0xB6, 0x87, 0x13, 0x01, 0x00, 0x00}, mod[7] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0x90, 0x90};
+    DWORD old;
+    if (on == g_aiPhys) return;
+    if (memcmp(p, on ? orig : mod, 7)) { bot_log("ERROR: aiphys - bytes mismatch at 0x00e10a26"); return; }
+    VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &old); memcpy(p, on ? mod : orig, 7); VirtualProtect(p, 7, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 7);
+    g_aiPhys = on;
+    bot_log("aiphys: %s", on ? "ON - new soldiers are physics-controlled (the AISoldier blueprint's PhysicsControlled 0 ignored)" : "OFF");
+}
+static int ai_phys_convert_one(char *so)   // one AI soldier: keyframed body out of the world, physics-controlled (see ai_phys)
+{
+    if (!so || IsBadReadPtr(so + 0x24c, 4) || so[0x249]) return 0;
+    unsigned char *cp = *(unsigned char **)(so + 0x1d4);
+    if (!cp || IsBadReadPtr(cp, 0x100)) return 0;
+    void *body = *(void **)(cp + 0xe0);
+    if (body && (cp[0x78] & 4)) {
+        char *c38 = *(char **)(cp + 0x38), *c3838 = c38 && !IsBadReadPtr(c38 + 0x38, 4) ? *(char **)(c38 + 0x38) : NULL;
+        void *world = c3838 && !IsBadReadPtr(c3838 + 0x34, 4) ? *(void **)(c3838 + 0x34) : NULL;
+        if (!world) return 0;
+        char res;
+        ((void (__attribute__((thiscall)) *)(void *, char *, void *))0x0187e150)(world, &res, body);
+        cp[0x78] &= ~4;
+    }
+    *(void **)(cp + 0xe0) = NULL;
+    so[0x249] = 1;
+    ((void (__attribute__((thiscall)) *)(void *, char, char))0x0061a200)(cp, 1, 0);
+    return 1;
+}
+static int ai_phys_convert(void)
+{
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    int n = 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *p = arr[k];
+        if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p)) continue;
+        char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+        if (!so || IsBadReadPtr(so + 0x24c, 4) || so[0x249]) continue;
+        unsigned char *cp = *(unsigned char **)(so + 0x1d4);
+        if (!cp || IsBadReadPtr(cp, 0x100)) continue;
+        void *body = *(void **)(cp + 0xe0);
+        if (body && (cp[0x78] & 4)) {
+            char *c38 = *(char **)(cp + 0x38), *c3838 = c38 && !IsBadReadPtr(c38 + 0x38, 4) ? *(char **)(c38 + 0x38) : NULL;
+            void *world = c3838 && !IsBadReadPtr(c3838 + 0x34, 4) ? *(void **)(c3838 + 0x34) : NULL;
+            if (!world) continue;
+            char res;
+            ((void (__attribute__((thiscall)) *)(void *, char *, void *))0x0187e150)(world, &res, body);
+            cp[0x78] &= ~4;
+        }
+        *(void **)(cp + 0xe0) = NULL;
+        so[0x249] = 1;
+        ((void (__attribute__((thiscall)) *)(void *, char, char))0x0061a200)(cp, 1, 0);
+        n++;
+    }
+    bot_log("aiphys: %d existing AI soldier(s) made physics-controlled", n);
+    return n;
+}
+
+// ---- aiblueprint coop|off (2026-11-02, the invisible / misplaced AI): a client takes a soldier ghost's replicated position only when
+// ITS OWN copy of the soldier's SoldierEntityData has PhysicsControlled (+0x113) = 1 (ClientSoldierReplication::updateReplicated is
+// gated on it) - AISoldier has 0: the clients animate the AI themselves and never see where the server's (now walking) body is.
+// Every AI CharacterSpawnEntity (data PlayerType 1) whose blueprint (data+0x50) is Characters/Soldiers/AISoldier gets the level's
+// co-op player blueprint (CoopSoldier - physics-controlled, loaded on every client); their kits (+0x188 templates) are kept.
+static char *g_bpSp[160], *g_bpOrig[160]; static int g_bpN; static char g_bpLevel[64];
+static void ai_blueprint(int on)
+{
+    if (!on) {
+        for (int k = 0; k < g_bpN; k++) {
+            char *d = !IsBadReadPtr(g_bpSp[k] + 0x14, 4) ? *(char **)(g_bpSp[k] + 0x14) : NULL;
+            if (d && !IsBadWritePtr(d + 0x50, 4)) *(char **)(d + 0x50) = g_bpOrig[k];
+        }
+        bot_log("aiblueprint: OFF (%d spawner(s) restored)", g_bpN);
+        g_bpN = 0;
+        return;
+    }
+    char *sp[160], *coop = NULL;
+    int n = scan_objects(0x025bbbc0, sp, 160);
+    for (int k = 0; k < n && !coop; k++) {
+        char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+        if (d && !IsBadReadPtr(d, 0x190) && *(int *)(d + 0x180) == 0 && strstr(asset_name(*(void **)(d + 0x50)), "CoopSoldier")) coop = *(char **)(d + 0x50);
+    }
+    if (!coop) { bot_log("aiblueprint: no CoopSoldier spawner on this level"); return; }
+    int changed = 0;
+    for (int k = 0; k < n && g_bpN < 160; k++) {
+        char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+        if (!d || IsBadReadPtr(d, 0x190) || *(int *)(d + 0x180) != 1) continue;
+        char *bp = *(char **)(d + 0x50);
+        if (!strstr(asset_name(bp), "AISoldier")) continue;
+        DWORD old;
+        VirtualProtect(d + 0x50, 4, PAGE_READWRITE, &old);
+        g_bpSp[g_bpN] = sp[k]; g_bpOrig[g_bpN] = bp; g_bpN++;
+        *(char **)(d + 0x50) = coop;
+        changed++;
+    }
+    bot_log("aiblueprint: %d AI spawner(s) now spawn %s (physics-controlled - clients take the server's positions)", changed, asset_name(coop));
+}
+
+// ---- antray real (2026-11-02, scratchpad\rayprov): the ray-query provider the client's ClientPhantomComponent gives the Ant
+// OverrideTrajectory node (vt 0x02622fb0 at comp+0x10). The node (0x00ac5a80 issues, 0x00ac5d00 polls, same frame) casts two 1 m rays
+// along the trajectory motion (vt+4 rayQueryAsync(from, to, flags, q), ret 10h) and reads only the hit bit (q+0x44 bit0) once both
+// queries are idle (q+0x30 == 0): a hit = wall ahead -> the motion delta is zeroed and the trajectory pinned (no walking into walls).
+// Query (0x50): +00 from, +10 to, +20 normal, +30 pending, +34 fraction, +38 id, +3C filter, +40 extra, +44 flags (bit0 hit, bit1 new).
+// Answered synchronously by the server's GameWorld raycast (characters skipped, like the client ignoring its own body).
+typedef struct AntRayQuery { float from[4], to[4], normal[4]; void *pending; float fraction; int id; unsigned filter; int *extraOut; unsigned char flags; } AntRayQuery;
+static volatile LONG g_frpQueries, g_frpHits, g_frpLogged, g_frpVertical;
+static unsigned g_frpRayFlags = RAY_DONT_CHECK_CHARACTER;
+static void frp_fill(AntRayQuery *q, const float *f, const float *t)
+{
+    void *world = *(void **)ADDR_GAME_WORLD;
+    float from[4] __attribute__((aligned(16))) = {f[0], f[1], f[2], 0}, to[4] __attribute__((aligned(16))) = {t[0], t[1], t[2], 0};
+    RayHit hit __attribute__((aligned(16)));
+    memset(&hit, 0, sizeof hit);
+    *(int *)(hit.rest + 0x08) = -1; *(int *)(hit.rest + 0x0c) = -1;
+    // (15:30 test: on the server the motion vector points straight down (from 0.6 m above the feet to 0.6 m below) - every ray hit
+    //  the floor and the node held every AI "blocked" (motion zeroed). The node is a wall check: a ray that is mostly vertical is
+    //  answered "free" without casting.)
+    float hx = t[0] - f[0], hz = t[2] - f[2], vy = t[1] - f[1];
+    int vertical = hx * hx + hz * hz < vy * vy;
+    if (vertical) InterlockedIncrement(&g_frpVertical);
+    int r = !vertical && world && f[0] == f[0] && t[0] == t[0] ? ((RayCast_t)ADDR_GAMEWORLD_RAYCAST)(world, ray_name(), 1, from, to, &hit, g_frpRayFlags, NULL) != 0 : 0;
+    memcpy(q->from, from, 16); memcpy(q->to, to, 16);
+    InterlockedIncrement(&g_frpQueries);
+    if (r) {
+        float dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2], L2 = dx * dx + dy * dy + dz * dz;
+        float ex = hit.pos[0] - from[0], ey = hit.pos[1] - from[1], ez = hit.pos[2] - from[2];
+        memcpy(q->normal, hit.normal, 12); q->normal[3] = 0;
+        q->fraction = L2 > 0 ? sqrtf((ex * ex + ey * ey + ez * ez) / L2) : 0;
+        q->flags |= 1;
+        InterlockedIncrement(&g_frpHits);
+    } else {
+        q->normal[0] = 0; q->normal[1] = 1; q->normal[2] = 0; q->normal[3] = 0;
+        q->fraction = 0; q->flags &= ~1;
+    }
+    q->flags |= 2; q->pending = NULL; q->id = -1;
+    if (g_frpLogged < 6 && InterlockedIncrement(&g_frpLogged) <= 6)
+        bot_log("antray: query from (%.1f %.1f %.1f) to (%.1f %.1f %.1f) -> %s", from[0], from[1], from[2], to[0], to[1], to[2], r ? "HIT" : vertical ? "free (vertical)" : "free");
+}
+#define FRP_TC __attribute__((thiscall, force_align_arg_pointer))
+static FRP_TC void *frp_dtor(void *s, int f) { (void)f; return s; }
+static FRP_TC void frp_query(void *s, const float *f, const float *t, int fl, AntRayQuery *q) { (void)s; (void)fl; if (q && f && t) frp_fill(q, f, t); }
+static FRP_TC void frp_poll(void *s, AntRayQuery *q) { (void)s; if (q) q->flags &= ~2; }
+static FRP_TC int frp_sync(void *s, const float *f, const float *t, int fl, AntRayQuery *q) { (void)s; (void)fl; if (!q || !f || !t) return 0; frp_fill(q, f, t); return q->flags & 1; }
+static FRP_TC int frp_nop4(void *s, int a, int b, int c, int d) { (void)s; (void)a; (void)b; (void)c; (void)d; return 0; }
+static void *g_frpVt[8] = {(void *)frp_dtor, (void *)frp_query, (void *)frp_poll, (void *)frp_sync, (void *)frp_nop4, (void *)frp_nop4, (void *)frp_nop4, (void *)frp_nop4};
+
+// ---- antworld on|off (2026-11-02, scratchpad\rootmotion + antspace research): the server soldier's GameAnimatable gives Ant its
+// entity matrix as entity-space type 1/2 only - setBone 0x5b03d0 (thiscall ant, (mat*, flag, bone), ret 0Ch) pins a bone inside the
+// pose solve, the graph itself stays MODEL space (the OverrideTrajectory subtree then collapses the trajectory to the origin).
+// Type 3 calls setTrajectoryAndReference 0x5ac0d0 (thiscall ant, (mat*, bool), ret 8): trajectory + reference written into
+// game-state channel A = world space. antworld: the three setBone calls of updateEntitySpace 0x8554e0 (0x8555b0 / 0x8555cc /
+// 0x8556b4) go through ant_setbone_hook - for co-op AI animatables it also sets the trajectory and reference from the same matrix.
+#define ADDR_ANT_SETBONE 0x005b03d0
+#define ADDR_ANT_SETTRAJREF 0x005ac0d0
+static const DWORD kSetBoneCalls[3] = {0x008555b0, 0x008555cc, 0x008556b4};
+static int g_antWorld; static volatile LONG g_antWorldSet, g_antWorldSet0;
+static void *g_aiAnts[64]; static char *g_aiAntMat[64], *g_aiAntSo[64]; static volatile int g_aiAntN;
+#define ADDR_ANT_CLEARSPACE_CALL 0x00855a9a   // updateEntitySpace's "no entity space" path: call 0x005a0370 (ant: clear +0x114/+0x115)
+// For AI with no entity-space request (type 0) the reference is set there - the same point in the frame as the setBone path.
+static __attribute__((thiscall, force_align_arg_pointer)) void ant_clearspace_hook(char *ant)
+{
+    ant[0x114] = 0; ant[0x115] = 0;
+    if (!g_antWorld) return;
+    int n = g_aiAntN;
+    for (int k = 0; k < n && k < 64; k++)
+        if (g_aiAnts[k] == ant) {
+            // (15:45: the entity transform was no usable source (never set) - the matrix is built from the soldier itself:
+            //  translation +0x4b0, yaw +0x218 (forward = (sin, 0, cos), rows left / up / forward / translation))
+            char *so = g_aiAntSo[k];
+            if (!so || IsBadReadPtr(so + 0x4b0, 12)) return;
+            float *tp = (float *)(so + OFF_SOLDIER_SPAWN_POSITION), yw = *(float *)(so + OFF_SOLDIER_YAW), sy = sinf(yw), cy = cosf(yw);
+            float mat[16] __attribute__((aligned(16))) = {cy, 0, -sy, 0,  0, 1, 0, 0,  sy, 0, cy, 0,  tp[0], tp[1], tp[2], 1};
+            if (mat[12] != mat[12] || (mat[12] == 0 && mat[14] == 0)) return;
+            // (15:10 test: the reference alone still collapsed them to the origin - the AI that held were the type-1 ones, whose
+            //  matrix updateEntitySpace pins into the pose solve via setBone(mat, 0, 0xff) (= its type-1 "no bone" call 0x008555cc))
+            ((void (__attribute__((thiscall)) *)(void *, void *, int, int))ADDR_ANT_SETBONE)(ant, mat, 0, 0xff);
+            ((void (__attribute__((thiscall)) *)(void *, void *, int))ADDR_ANT_SETTRAJREF)(ant, mat, 0);
+            g_antWorldSet0++;
+            return;
+        }
+}
+static __attribute__((thiscall, force_align_arg_pointer)) void ant_setbone_hook(char *ant, void *mat, int flag, int bone)
+{
+    ((void (__attribute__((thiscall)) *)(void *, void *, int, int))ADDR_ANT_SETBONE)(ant, mat, flag, bone);
+    if (!g_antWorld || !mat) return;
+    int n = g_aiAntN;
+    for (int k = 0; k < n && k < 64; k++)
+        if (g_aiAnts[k] == ant) {
+            ((void (__attribute__((thiscall)) *)(void *, void *, int))ADDR_ANT_SETTRAJREF)(ant, mat, 0);
+            g_antWorldSet++;
+            return;
+        }
+}
+static void ai_ants_refresh(void)   // the co-op AI's Ant animatables (BotManager bots -> loco -> [loco+0x4a0]+0x10+0xc4)
+{
+    char *bm = *(char **)0x02bdac28;
+    char **b0 = bm && !IsBadReadPtr(bm + 0x21c, 8) ? *(char ***)(bm + 0x21c) : NULL, **b1 = b0 ? *(char ***)(bm + 0x220) : NULL;
+    int nb = b0 && b1 > b0 ? (int)(b1 - b0) : 0, n = 0;
+    for (int k = 0; k < nb && n < 64; k++) {
+        char *bot = b0[k], *pf, *mc, *loco, *comp, *ant;
+        if (!bot || IsBadReadPtr(bot, 0x6d0) || !(pf = *(char **)(bot + 0x3b0)) || IsBadReadPtr(pf, 0x40)) continue;
+        if (!(mc = *(char **)(pf + 8)) || IsBadReadPtr(mc, 4) || *(unsigned *)mc != 0x025c5d48) continue;
+        loco = mc - 0x20;
+        if (IsBadReadPtr(loco, 0x5a0) || !(comp = *(char **)(loco + 0x4a0)) || IsBadReadPtr(comp, 0x240)) continue;
+        if (!(ant = *(char **)(comp + 0x10 + 0xc4)) || IsBadReadPtr(ant, 0x190)) continue;
+        g_aiAntMat[n] = NULL;
+        {
+            char *pref = *(char **)(bot + 0x320), *pl = pref && !IsBadReadPtr(pref, 4) && *(char **)pref ? *(char **)pref - 8 : NULL;
+            g_aiAntSo[n] = pl && !IsBadReadPtr(pl + OFF_PLAYER_SOLDIER, 4) ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+        }
+        g_aiAnts[n++] = ant;
+        // (AI whose GameAnimatable has no entity-space request (type [ga+0x70] 0: updateEntitySpace never calls setBone for them)
+        //  - their trajectory / reference is set here from the entity's own transform [[[loco+8]]+0x1c] (indexed when bit 0x12))
+        int type = *(int *)(comp + 0x10 + 0x70);
+        if (!g_antWorld || (type >= 1 && type <= 4)) continue;
+        char *e = *(char **)(loco + 8), *sx = e && !IsBadReadPtr(e, 4) ? *(char **)e : NULL;
+        char *m = sx && !IsBadReadPtr(sx, 0x20) ? *(char **)(sx + 0x1c) : NULL;
+        if (m && ((*(unsigned *)(sx + 8) >> 0x12) & 1)) m = m + 0x10 + 0x50 * *(unsigned char *)(m + 6);
+        if (m && !IsBadReadPtr(m, 0x40)) g_aiAntMat[n - 1] = m;
+    }
+    g_aiAntN = n;
+}
+static void ant_world(int on)
+{
+    DWORD old;
+    if (on == g_antWorld) return;
+    for (int k = 0; k < 3; k++) {
+        unsigned char *p = (unsigned char *)kSetBoneCalls[k];
+        DWORD want = on ? ADDR_ANT_SETBONE : (DWORD)ant_setbone_hook, to = on ? (DWORD)ant_setbone_hook : ADDR_ANT_SETBONE;
+        if (p[0] != 0xE8 || *(DWORD *)(p + 1) + (DWORD)p + 5 != want) { bot_log("ERROR: antworld - call mismatch at %p", p); return; }
+    }
+    {
+        unsigned char *p = (unsigned char *)ADDR_ANT_CLEARSPACE_CALL;
+        DWORD want = on ? 0x005a0370 : (DWORD)ant_clearspace_hook;
+        if (p[0] != 0xE8 || *(DWORD *)(p + 1) + (DWORD)p + 5 != want) { bot_log("ERROR: antworld - call mismatch at %p", p); return; }
+    }
+    if (on) ai_ants_refresh();
+    {
+        unsigned char *p = (unsigned char *)ADDR_ANT_CLEARSPACE_CALL;
+        DWORD to = on ? (DWORD)ant_clearspace_hook : 0x005a0370;
+        VirtualProtect(p + 1, 4, PAGE_EXECUTE_READWRITE, &old);
+        InterlockedExchange((LONG *)(p + 1), (LONG)(to - ((DWORD)p + 5)));
+        VirtualProtect(p + 1, 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+    }
+    for (int k = 0; k < 3; k++) {
+        unsigned char *p = (unsigned char *)kSetBoneCalls[k];
+        DWORD to = on ? (DWORD)ant_setbone_hook : ADDR_ANT_SETBONE;
+        VirtualProtect(p + 1, 4, PAGE_EXECUTE_READWRITE, &old);
+        InterlockedExchange((LONG *)(p + 1), (LONG)(to - ((DWORD)p + 5)));
+        VirtualProtect(p + 1, 4, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+    }
+    g_antWorld = on;
+    bot_log("antworld: %s", on ? "ON - co-op AI animatables get their world trajectory/reference each frame (setTrajectoryAndReference)" : "OFF");
+}
+
+// ---- aihost on|off (2026-11-02, scratchpad\remoteloco): on a listen server the HOST's client runs every AI move order and acks it
+// back in shared memory; a dedicated server has nobody to ack. Without a server animation manager ([loco+0x568] = 0, e.g. Exodus)
+// the server loco then never adopts an order ([loco+0x4ac] stays NULL, curId [loco+0x4b0] stuck) - its soldier never moves, the
+// clients animate it to its point and walk it back to the server position afterwards. aihost plays the host: the 5 networked
+// slots at [loco+0x4c]..[loco+0x50] (0x14 each: +4 task, +8 id 0..30, +0x12 flags bit0 valid bit1 done); "start N" = ackId
+// [loco+0x30] = N, ackState [loco+0x44] = 0 (0xe17da0 then clones the task into [loco+0x4ac] - aimove steers the soldier there);
+// "arrived" = ackState 3 (slot freed, the behaviour told, the next order issued).
+typedef struct AiHost { char *loco; int running, id; DWORD started; float lastD; DWORD lastProgress; } AiHost;
+static AiHost g_aiHost[64]; static int g_aiHostOn; static volatile LONG g_aiHostStarted, g_aiHostDone, g_aiHostTimeout, g_aiHostLogged;
+static AiHost *ai_host_slot(char *loco)
+{
+    AiHost *free_ = NULL;
+    for (int k = 0; k < 64; k++) { if (g_aiHost[k].loco == loco) return &g_aiHost[k]; if (!g_aiHost[k].loco && !free_) free_ = &g_aiHost[k]; }
+    if (free_) { memset(free_, 0, sizeof *free_); free_->loco = loco; }
+    return free_;
+}
+static void ai_host_tick(void)
+{
+    if (!g_aiHostOn) return;
+    char *bm = *(char **)0x02bdac28;
+    char **b0 = bm && !IsBadReadPtr(bm + 0x21c, 8) ? *(char ***)(bm + 0x21c) : NULL, **b1 = b0 ? *(char ***)(bm + 0x220) : NULL;
+    int nb = b0 && b1 > b0 ? (int)(b1 - b0) : 0;
+    char *seen[64]; int ns = 0, needPhys = 0;
+    DWORD now = GetTickCount();
+    for (int k = 0; k < nb && k < 64; k++) {
+        char *bot = b0[k], *pf, *mc, *loco;
+        if (!bot || IsBadReadPtr(bot, 0x6d0) || !(pf = *(char **)(bot + 0x3b0)) || IsBadReadPtr(pf, 0x40)) continue;
+        if (!(mc = *(char **)(pf + 8)) || IsBadReadPtr(mc, 4) || *(unsigned *)mc != 0x025c5d48) continue;
+        loco = mc - 0x20;
+        if (IsBadReadPtr(loco, 0x610)) continue;
+        char *pref = *(char **)(bot + 0x320), *pl = pref && !IsBadReadPtr(pref, 4) && *(char **)pref ? *(char **)pref - 8 : NULL;
+        char *so = pl && !IsBadReadPtr(pl + OFF_PLAYER_SOLDIER, 4) ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+        if (!so || IsBadReadPtr(so + 0x4c0, 4) || player_vehicle(pl)) continue;
+        // (Exodus' AI spawn keyframed even with aiphys on; 2026-11-03: in BOTH loco modes - with the server animation on (local
+        //  mode) none of them moved under aimove either. Only AI with a move order: converting all of them dropped ~9 building
+        //  defenders through a floor the server's physics does not have - keyframed they stand on their spawn height.)
+        if (!so[0x249] && g_aiPhys) {
+            int hasOrder = 0;
+            if (loco[0x568]) hasOrder = *(char **)(loco + 0x4ac) != NULL;
+            else {
+                char *b0s = *(char **)(loco + 0x4c), *b1s = *(char **)(loco + 0x50);
+                for (char *q = b0s; q && b1s > q && q < b0s + 5 * 0x14; q += 0x14) if ((q[0x12] & 3) == 1 && *(char **)(q + 4)) hasOrder = 1;
+            }
+            if (hasOrder && ai_phys_convert_one(so)) { needPhys++; }
+        }
+        if (loco[0x568]) continue;   // (local mode: the server runs the tasks itself)
+        seen[ns++] = loco;
+        AiHost *h = ai_host_slot(loco);
+        if (!h) continue;
+        char *sb = *(char **)(loco + 0x4c), *se = *(char **)(loco + 0x50);
+        int nslot = sb && se > sb ? (int)((se - sb) / 0x14) : 0;
+        if (nslot > 5 || IsBadReadPtr(sb, nslot * 0x14)) continue;
+        int cur = *(int *)(loco + 0x4b0);
+        char *task = *(char **)(loco + 0x4ac);
+        if (h->running) {
+            if (cur != h->id || !task || IsBadReadPtr(task, 0x60)) {   // (the server has not adopted it yet)
+                if (now - h->started > 3000) { h->running = 0; g_aiHostTimeout++; }
+                continue;
+            }
+            unsigned tvt = *(unsigned *)task;
+            float *tp = (float *)(task + (tvt == 0x024ddac0 ? 0x40 : 0x30)), r = *(float *)(task + 0x1c);
+            float *pos = so[0x249] ? (float *)(so + OFF_SOLDIER_POSITION) : (float *)(so + OFF_SOLDIER_SPAWN_POSITION);
+            if (r < 0.5f || r != r) r = 0.5f;
+            float dx = tp[0] - pos[0], dz = tp[2] - pos[2], d = tp[0] < -40000.0f || tp[0] != tp[0] ? 0 : sqrtf(dx * dx + dz * dz);
+            if (d < h->lastD - 0.3f) { h->lastD = d; h->lastProgress = now; }
+            int stuck = now - h->lastProgress > 15000;   // (no 0.3 m nearer in 15 s (a route detour can lead away first): give it up as done)
+            if (d <= r + 0.3f || stuck) {
+                *(int *)(loco + 0x44) = 3;
+                h->running = 0;
+                if (stuck) g_aiHostTimeout++; else g_aiHostDone++;
+            }
+            continue;
+        }
+        int done = !task || (*(unsigned char *)(loco + 0x4ba) & 2);
+        int want = done ? (cur + 1) % 31 : cur;
+        for (int q = 0; q < nslot; q++) {
+            char *sl = sb + q * 0x14;
+            if (*(int *)(sl + 8) != want || (sl[0x12] & 3) != 1 || !*(char **)(sl + 4)) continue;
+            *(int *)(loco + 0x30) = want;
+            *(int *)(loco + 0x44) = 0;
+            h->running = 1; h->id = want; h->started = now; h->lastD = 1e9f; h->lastProgress = now;
+            g_aiHostStarted++;
+            if (g_aiHostLogged < 8 && InterlockedIncrement(&g_aiHostLogged) <= 8) {
+                char *t = *(char **)(sl + 4);
+                float *tp = !IsBadReadPtr(t, 0x50) ? (float *)(t + (*(unsigned *)t == 0x024ddac0 ? 0x40 : 0x30)) : NULL;
+                bot_log("aihost: %s takes order %d (task vt %08x) -> (%.1f %.1f %.1f)", pl + OFF_PLAYER_ONLINE_NAME, want,
+                        !IsBadReadPtr(t, 4) ? *(unsigned *)t : 0, tp ? tp[0] : 0, tp ? tp[1] : 0, tp ? tp[2] : 0);
+            }
+            break;
+        }
+    }
+    if (needPhys) bot_log("aihost: %d AI with a move order made physics-controlled", needPhys);
+    for (int k = 0; k < 64; k++) {   // (forget AI that are gone)
+        if (!g_aiHost[k].loco) continue;
+        int f = 0;
+        for (int q = 0; q < ns; q++) if (seen[q] == g_aiHost[k].loco) { f = 1; break; }
+        if (!f) g_aiHost[k].loco = NULL;
+    }
+}
+
+// ---- The Ant graph node with no link (2026-10-30, co-op with "serveranim on"): every soldier is animated on the server now; at the
+// players' spawn (Exfiltration's humvee intro) the node evaluator 0x00ac5d00 (thiscall, ret 4; push ebp / and esp / sub 54h / push
+// ebx esi edi) reads an interface pointer into [esp+14h] (from a lookup at 0x00a99170 or the node's +14h) and calls through it at
+// 0x00ac5daa - NULL there (crash 17:13 and 16:14, every co-op Ant bank converted or not). The 6 bytes at 0x00ac5da6 (mov ecx,[esp+14h];
+// mov eax,[ecx]) jump to a stub: NULL -> count it and leave the node (pop edi/esi/ebx; mov esp,ebp; pop ebp; ret 4) unevaluated.
+#define ADDR_ANT_NODE_NULL 0x00ac5da6
+static const unsigned char kAntNodeNull[6] = {0x8B, 0x4C, 0x24, 0x14, 0x8B, 0x01};
+static unsigned char *g_antNodeStub;
+static volatile LONG g_antNodeSkipped, g_antNodeDummied;
+static int g_antNodeGuard;
+static volatile unsigned char g_antRayDummy;   // antray dummy|skip (2026-11-02): give the node a no-hit provider instead of skipping it
+static void ant_node_guard(int on)
+{
+    DWORD old;
+    if (on && !g_antNodeGuard) {
+        if (memcmp((void *)ADDR_ANT_NODE_NULL, kAntNodeNull, 6)) { bot_log("ERROR: antnode guard - bytes mismatch"); return; }
+        if (!g_antNodeStub) g_antNodeStub = VirtualAlloc(NULL, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        // (2026-10-30 research: the NULL is the AsyncQuery provider of an OverrideTrajectorySceneOpAsset - a ray-query service only
+        //  the client's ClientPhantomComponent registers (vtable: dtor ret 4, rayQuery ret 10h, poll ret 4). A fake one that does
+        //  nothing ("no hit") is put in [esp+14h] AND as the GameState handle's default (+14h) - so 0x00ac5a80, which reads the same
+        //  pointer unguarded, gets it too; the node then evaluates normally instead of being skipped.)
+        // (the dummy ray-query provider (10:36) - every players' spawn after it crashed at 0x00961498 (12:25, 13:49, 13:52, 14:01): back
+        //  to leaving the node unevaluated, which spawned and played fine 10:15-11:04)
+        // (2026-11-02: the node is evaluated for every co-op AI every frame (~30/s each) and skipping it leaves the server's AI
+        //  without a walk cycle / root motion - "antray dummy" retries the no-hit provider now that the 0x00961498 crash is known to
+        //  be the MoveToTargetJob dispatch (move_target_guard). The provider's calls return 0; switchable at run time.)
+        unsigned char *st = g_antNodeStub; int k = 0, jz, jnz, jd;
+        unsigned char *fn = st + 0x80, *vt = st + 0xa0, *fake = st + 0xc0;
+        fn[0] = 0x31; fn[1] = 0xC0; fn[2] = 0xC2; fn[3] = 0x04; fn[4] = 0x00;    // xor eax,eax; ret 4
+        fn[8] = 0x31; fn[9] = 0xC0; fn[10] = 0xC2; fn[11] = 0x10; fn[12] = 0x00; // xor eax,eax; ret 10h
+        ((DWORD *)vt)[0] = (DWORD)fn; ((DWORD *)vt)[1] = (DWORD)(fn + 8); ((DWORD *)vt)[2] = (DWORD)fn; ((DWORD *)vt)[3] = (DWORD)(fn + 8);
+        ((DWORD *)vt)[4] = (DWORD)fn; ((DWORD *)vt)[5] = (DWORD)fn; ((DWORD *)vt)[6] = (DWORD)fn; ((DWORD *)vt)[7] = (DWORD)fn;
+        *(DWORD *)fake = (DWORD)vt;
+        memcpy(st + k, kAntNodeNull, 4); k += 4;                              // mov ecx,[esp+14h]
+        st[k++] = 0x81; st[k++] = 0xF9; *(DWORD *)(st + k) = (DWORD)fake; k += 4;   // cmp ecx,fake (left on the handle by "dummy")
+        st[k++] = 0x74; st[k++] = 0x04;                                       // je null-path
+        st[k++] = 0x85; st[k++] = 0xC9;                                       // test ecx,ecx
+        st[k++] = 0x75; jnz = k++;                                            // jnz ok
+        st[k++] = 0x80; st[k++] = 0x3D; *(DWORD *)(st + k) = (DWORD)&g_antRayDummy; k += 4; st[k++] = 0x00;   // cmp byte [g_antRayDummy],0
+        st[k++] = 0x74; jz = k++;                                             // jz skip
+        st[k++] = 0xF0; st[k++] = 0xFF; st[k++] = 0x05; *(DWORD *)(st + k) = (DWORD)&g_antNodeDummied; k += 4;   // lock inc
+        st[k++] = 0x8B; st[k++] = 0x44; st[k++] = 0x24; st[k++] = 0x18;      // mov eax,[esp+18h]   (the node)
+        st[k++] = 0x8B; st[k++] = 0x40; st[k++] = 0x0C;                      // mov eax,[eax+0Ch]   (its AsyncQuery handle)
+        st[k++] = 0x85; st[k++] = 0xC0; st[k++] = 0x74; st[k++] = 0x07;      // test eax,eax; jz +7
+        st[k++] = 0xC7; st[k++] = 0x40; st[k++] = 0x14; *(DWORD *)(st + k) = (DWORD)fake; k += 4;   // mov [eax+14h],fake (0x00ac5a80 reads it)
+        st[k++] = 0xB9; *(DWORD *)(st + k) = (DWORD)fake; k += 4;           // mov ecx,fake
+        st[k++] = 0x89; st[k++] = 0x4C; st[k++] = 0x24; st[k++] = 0x14;     // mov [esp+14h],ecx
+        st[k++] = 0xEB; jd = k++;                                             // jmp ok
+        st[jnz] = (unsigned char)(k - (jnz + 1)); st[jd] = (unsigned char)(k - (jd + 1));
+        st[k++] = 0x8B; st[k++] = 0x01;                                       // ok: mov eax,[ecx]
+        st[k++] = 0xE9; *(DWORD *)(st + k) = (DWORD)((unsigned char *)0x00ac5dac - (st + k + 4)); k += 4;   // jmp back
+        st[jz] = (unsigned char)(k - (jz + 1));
+        st[k++] = 0xF0; st[k++] = 0xFF; st[k++] = 0x05; *(DWORD *)(st + k) = (DWORD)&g_antNodeSkipped; k += 4;   // skip: lock inc
+        static const unsigned char ep[9] = {0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x04, 0x00};   // the function's epilogue
+        memcpy(st + k, ep, 9); k += 9;
+        if (k > 0x80) bot_log("ERROR: antnode stub overflow %d", k);
+        FlushInstructionCache(GetCurrentProcess(), st, 0x100);
+        unsigned char j[6] = {0xE9, 0, 0, 0, 0, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(st - ((unsigned char *)ADDR_ANT_NODE_NULL + 5));
+        VirtualProtect((void *)ADDR_ANT_NODE_NULL, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_ANT_NODE_NULL, j, 6);
+        VirtualProtect((void *)ADDR_ANT_NODE_NULL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_ANT_NODE_NULL, 6);
+        g_antNodeGuard = 1;
+        bot_log("animguard: Ant trajectory nodes with no ray-query provider are left unevaluated instead of crashing (0x00ac5daa)");
+    } else if (!on && g_antNodeGuard) {
+        VirtualProtect((void *)ADDR_ANT_NODE_NULL, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_ANT_NODE_NULL, kAntNodeNull, 6);
+        VirtualProtect((void *)ADDR_ANT_NODE_NULL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_ANT_NODE_NULL, 6);
+        g_antNodeGuard = 0;
+    }
+}
+
+// ---- animguard on|off (2026-10-28, co-op maps): an entity whose animation data is missing (Exodus' co-op Ant banks exist only in
+// the client's byte order - left out of the server's copy) crashed the server right after "level loaded": function 0x00606ed0
+// (ret 0Ch, 0xda8 frame) reads a resource pointer from [esp+24h] at 0x006070e1 and dereferences it (+0Ch) unchecked - NULL ->
+// ACCESS_VIOLATION reading 0xc. The 11 bytes at 0x006070e1 (mov eax,[esp+24h]; mov ecx,[esp+0DC0h]) become a jmp to a stub: NULL ->
+// count it and jump to the function's own exit path 0x00607513 (frees its locals, ret 0Ch); else the original two instructions and
+// back to 0x006070ec. Never NULL on the stock maps.
+#define ADDR_ANIM_NULLREAD 0x006070e1
+static const unsigned char kAnimNullRead[11] = {0x8B, 0x44, 0x24, 0x24, 0x8B, 0x8C, 0x24, 0xC0, 0x0D, 0x00, 0x00};
+static unsigned char *g_animStub;
+static volatile LONG g_animSkipped;
+static int g_animGuard;
+static void anim_guard(int on)
+{
+    DWORD old;
+    if (on && !g_animGuard) {
+        if (memcmp((void *)ADDR_ANIM_NULLREAD, kAnimNullRead, 11)) { bot_log("ERROR: animguard - bytes mismatch"); return; }
+        if (!g_animStub) g_animStub = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *s = g_animStub;
+        int k = 0, jz;
+        memcpy(s + k, kAnimNullRead, 4); k += 4;                           // mov eax,[esp+24h]
+        s[k++] = 0x85; s[k++] = 0xC0;                                      // test eax,eax
+        s[k++] = 0x74; jz = k++;                                           // jz bail
+        memcpy(s + k, kAnimNullRead + 4, 7); k += 7;                       // mov ecx,[esp+0DC0h]
+        s[k++] = 0xE9; *(DWORD *)(s + k) = (DWORD)((unsigned char *)0x006070ec - (s + k + 4)); k += 4;   // jmp back
+        s[jz] = (unsigned char)(k - (jz + 1));
+        s[k++] = 0xF0; s[k++] = 0xFF; s[k++] = 0x05; *(DWORD *)(s + k) = (DWORD)&g_animSkipped; k += 4;  // lock inc [g_animSkipped]
+        s[k++] = 0xE9; *(DWORD *)(s + k) = (DWORD)((unsigned char *)0x00607513 - (s + k + 4)); k += 4;   // jmp exit path
+        FlushInstructionCache(GetCurrentProcess(), s, 64);
+        unsigned char j[11] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(s - ((unsigned char *)ADDR_ANIM_NULLREAD + 5));
+        VirtualProtect((void *)ADDR_ANIM_NULLREAD, 11, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_ANIM_NULLREAD, j, 11);
+        VirtualProtect((void *)ADDR_ANIM_NULLREAD, 11, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_ANIM_NULLREAD, 11);
+        g_animGuard = 1;
+        bot_log("animguard: ON - entities with missing animation data are skipped instead of crashing");
+        ant_node_guard(1);
+        avoid_pool_hook(1);
+        move_target_guard(1);
+    } else if (!on && g_animGuard) {
+        VirtualProtect((void *)ADDR_ANIM_NULLREAD, 11, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_ANIM_NULLREAD, kAnimNullRead, 11);
+        VirtualProtect((void *)ADDR_ANIM_NULLREAD, 11, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_ANIM_NULLREAD, 11);
+        g_animGuard = 0;
+        ant_node_guard(0);
+        avoid_pool_hook(0);
+        move_target_guard(0);
+        bot_log("animguard: OFF");
+    }
+}
+
+// ---- pointguard on|off (2026-10-29, co-op server 5): the points system keeps a record per player ID (a static table) and on a spawn /
+// death 0x01b8ea60 releases the object cached at record+0x6c0 before storing the new one. A bot BotMod deletes and adds again takes
+// the old player ID - the record still points at the deleted bot's freed object: the release asserts (int3 at 0x0043ec06) and the server
+// goes down (twice on a bot's death, 2026-10-29; "PlayerPointsInfo already created" at the re-adds). 0x01b8eb5f "je skip-release"
+// (74 10) becomes "jmp" (EB 10): the old object is never released - a small leak per spawn / death, no crash.
+// (first version: only the je at 0x01b8eb5f - the crash came back from the release at 0x01b8eb1f: the function releases FOUR cached
+// objects of the record. Now the four "call 0x43ebe0" (each followed by its own add esp,4) become 5 NOPs.)
+static const unsigned g_pointRelease[4] = {0x01b8eaaf, 0x01b8ead8, 0x01b8eb1f, 0x01b8eb69};
+static unsigned char g_pointSaved[4][5];
+static int g_pointGuard;
+static void point_guard(int on)
+{
+    if (on == g_pointGuard) { bot_log("pointguard: already %s", on ? "ON" : "OFF"); return; }
+    for (int k = 0; k < 4; k++) {
+        unsigned char *p = (unsigned char *)g_pointRelease[k];
+        if (on) {
+            int rel = *(int *)(p + 1);
+            if (p[0] != 0xE8 || (unsigned)(p + 5 + rel) != 0x0043ebe0) { bot_log("ERROR: pointguard - %p is not \"call 0x43ebe0\"", p); return; }
+        }
+    }
+    for (int k = 0; k < 4; k++) {
+        unsigned char *p = (unsigned char *)g_pointRelease[k];
+        DWORD old;
+        VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+        if (on) { memcpy(g_pointSaved[k], p, 5); memset(p, 0x90, 5); }
+        else memcpy(p, g_pointSaved[k], 5);
+        VirtualProtect(p, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+    }
+    {   // (and the assert itself: 0x0043ec06 int3 -> nop, the bad-state release just returns. The level change crashed from ANOTHER
+        // release site, 0x01b9b780 -> 0x01b9b837, 20:12:40 2026-10-29 - there are many; this covers them all)
+        unsigned char *a = (unsigned char *)0x0043ec06;
+        if (a[0] == (on ? 0xCC : 0x90) && a[1] == 0x5E && a[2] == 0xC3) {
+            DWORD old;
+            VirtualProtect(a, 1, PAGE_EXECUTE_READWRITE, &old);
+            a[0] = on ? 0x90 : 0xCC;
+            VirtualProtect(a, 1, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), a, 1);
+        } else bot_log("ERROR: pointguard - 0x0043ec06 bytes mismatch (%02x %02x %02x)", a[0], a[1], a[2]);
+    }
+    g_pointGuard = on;
+    bot_log("pointguard: %s", on ? "ON - the points record's old objects are not released (a deleted bot's freed ones crashed the server)" : "OFF");
+}
+
+// ---- inputguard on|off (2026-10-29, co-op server 5, the user: "remove the block server-wide so we can always use weapons"): the
+// mission's weapons hold is a ServerInputRestrictionEntity (vt 0x025bb8a8, its "Characters" link = the two co-op player spawners);
+// "weapons free" only reaches the soldiers those spawners made LAST - the squad bots once they spawn there, never the humans.
+// Its event handler 0x00de2ab0 tells Activate (0xdeaa09dc) by "cmp edi, imm32" at 0x00de2b96: the imm is zeroed - no restriction
+// is ever switched on - and every active one (players listed at +0x28..+0x2c) is switched off now: 0x00de28e0(this, 0) (its
+// Deactivate-for-all, 0x72f6cc1d).
+#define ADDR_INPUTRESTR_ACTIVATE_IMM 0x00de2b98
+static int g_inputGuard;
+static void input_guard(int on)
+{
+    unsigned *imm = (unsigned *)ADDR_INPUTRESTR_ACTIVATE_IMM;
+    if (*(unsigned short *)(ADDR_INPUTRESTR_ACTIVATE_IMM - 2) != 0xff81 || (*imm != 0xdeaa09dc && *imm != 0)) { bot_log("ERROR: inputguard - bytes mismatch"); return; }
+    DWORD old;
+    VirtualProtect(imm, 4, PAGE_EXECUTE_READWRITE, &old);
+    *imm = on ? 0 : 0xdeaa09dc;
+    VirtualProtect(imm, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), imm, 4);
+    g_inputGuard = on;
+    int off = 0;
+    if (on) {
+        char *ir[64];
+        int n = scan_objects(0x025bb8a8, ir, 64);
+        typedef void (__attribute__((thiscall)) *Deact_t)(void *self, int player);
+        for (int k = 0; k < n; k++)
+            if (!IsBadReadPtr(ir[k], 0x30) && *(unsigned *)(ir[k] + 0x28) != *(unsigned *)(ir[k] + 0x2c)) { ((Deact_t)0x00de28e0)(ir[k], 0); off++; }
+    }
+    bot_log("inputguard: %s%s", on ? "ON - input restrictions (the weapons hold) are never switched on" : "OFF", on ? "" : "");
+    if (on) bot_log("inputguard: %d active restriction(s) switched off", off);
+}
+
+// ---- serveranim on|off (2026-10-29, co-op AI): the dedicated server builds its Ant animation manager (ServerGameContext [0x2b3ee2c]
+// +0x18) in ServerLevel::load 0x00d654e0 only for LevelDescription.IsMultiplayer=1 and IsCoop=0 (+ GameAnimationSettings.ServerEnable,
+// "-GameAnimation.ServerEnable true" on server 5's command line). Without it every AI soldier's animatable is a "slave" ("Trying to
+// create slave animatable on dedicated server") - the mission AI never sees / aims / fires, the defector never walks. The two
+// "jne skip" (0F 85 rel32) after the !IsMultiplayer (0x00d65f23) and IsCoop (0x00d65f32) checks become 6 NOPs. Must be on before
+// the co-op level loads (startup, before levelswap's load).
+static const unsigned g_srvAnimJne[2] = {0x00d65f23, 0x00d65f32};
+static unsigned char g_srvAnimSaved[2][6];
+static int g_serverAnim;
+static void server_anim(int on)
+{
+    if (on == g_serverAnim) return;
+    for (int k = 0; k < 2; k++) {
+        unsigned char *p = (unsigned char *)g_srvAnimJne[k];
+        if (on && (p[0] != 0x0F || p[1] != 0x85)) { bot_log("ERROR: serveranim - %p is not jne rel32 (%02x %02x)", p, p[0], p[1]); return; }
+    }
+    for (int k = 0; k < 2; k++) {
+        unsigned char *p = (unsigned char *)g_srvAnimJne[k];
+        DWORD old;
+        VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
+        if (on) { memcpy(g_srvAnimSaved[k], p, 6); memset(p, 0x90, 6); } else memcpy(p, g_srvAnimSaved[k], 6);
+        VirtualProtect(p, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+    }
+    g_serverAnim = on;
+    bot_log("serveranim: %s", on ? "ON - co-op / SP levels get the server animation manager (with -GameAnimation.ServerEnable true)" : "OFF");
+}
+
+// ---- levelswap <FROM> <TO> | off (2026-10-28, co-op / SP maps on the server): the map list only takes known MP maps
+// (ServerControlledMapSequence::add 0x012c6d40 -> InvalidMapName / game mode checks). fb::Server::startLoadLevel 0x00d4c400
+// (thiscall Server*, no args; reached from the Server.LoadLevel message handler 0x00d50800) loads the C string at Server +0x20
+// (m_nextLevelSetup's name, e.g. "Levels/MP_Subway/MP_Subway"). A stub at its start calls level_swap(server): if that name is
+// Levels/FROM/FROM, it is overwritten IN PLACE with Levels/TO/TO (TO must not be longer than FROM), then the original prologue
+// (sub esp,134h) runs and it jumps back to 0x00d4c406. The rest of the load (game mode options, the clients' load) is stock.
+// TO's data must be in the server's layout.toc (tools\convert_level.py) - read at server START.
+#define ADDR_START_LOAD_LEVEL 0x00d4c400
+static const unsigned char kStartLoadPrologue[6] = {0x81, 0xEC, 0x34, 0x01, 0x00, 0x00};   // sub esp, 134h
+static char g_swapFrom[96], g_swapTo[96];
+static int g_swapHold;   // (swaphold on: see swap_hold_tick)
+static unsigned char *g_swapStub;
+static int g_swapHooked;
+static void __cdecl level_swap_inner(char *server);
+static char g_serverAnimExcept[256];   // serveranim except COOP_007,... (2026-11-02: Exodus' data has no server ragdolls - it loads
+                                       // only without the animation manager, as it did before serveranim)
+static void __cdecl level_swap(char *server)
+{
+    level_swap_inner(server);
+    // serveranim: GameAnimationSettings.ServerEnable ([0x2b2afd4]+0x44) on only while a co-op / SP level loads - on for every level
+    // (the "-GameAnimation.ServerEnable true" command line) the MP boot map built a manager too and crashed on its stripped ragdoll
+    // data ("ragdoll01 ... not available in compartment Game", 16:51).
+    char *name = server && !IsBadReadPtr(server + 0x20, 4) ? *(char **)(server + 0x20) : NULL;
+    char *gas = *(char **)0x02b2afd4;
+    if (g_serverAnim && name && !IsBadStringPtrA(name, 256) && gas && !IsBadWritePtr(gas + 0x44, 1)) {
+        int coop = strstr(name, "COOP_") || strstr(name, "/SP_");
+        const char *base = strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
+        if (coop && *base && g_serverAnimExcept[0]) {
+            char list[260]; snprintf(list, sizeof list, ",%s,", g_serverAnimExcept);
+            char key[80]; snprintf(key, sizeof key, ",%s,", base);
+            if (strstr(list, key)) { coop = 0; bot_log("serveranim: %s is in the exception list", base); }
+        }
+        gas[0x44] = coop ? 1 : 0;
+        bot_log("serveranim: %s loads - the server animation manager %s", name, coop ? "ON" : "off");
+    }
+}
+static void __cdecl level_swap_inner(char *server)
+{
+    char *name = server && !IsBadReadPtr(server + 0x20, 4) ? *(char **)(server + 0x20) : NULL;
+    if (!name || IsBadStringPtrA(name, 256)) return;
+    bot_log("levelswap: the server starts loading %s", name);
+    if (!g_swapFrom[0] || _stricmp(name, g_swapFrom)) return;
+    if (strlen(g_swapTo) > strlen(name) || IsBadWritePtr(name, strlen(g_swapTo) + 1)) { bot_log("levelswap: %s does not fit - not swapped", g_swapTo); return; }
+    strcpy(name, g_swapTo);
+    bot_log("levelswap: -> loading %s instead", name);
+}
+// The reload loop (650 loads of COOP_007): after a level loads, the map list (0x012c4460) looks the RUNNING level up in its known
+// maps (0x012c0f70) and checks the mode (0x012c28b0); COOP_007 is not known -> it reloads its current entry (0x012c2790 at
+// 0x012c47ca -> "Levels/MP_Subway/MP_Subway" -> swapped again). While a swap is armed, 0x012c47b3 (cmp eax,ebx; je; push eax)
+// becomes "jmp 0x012c47cf" (the check's success path = local cleanup only).
+#define ADDR_MAPSEQ_CHECK 0x012c47b3
+static const unsigned char kMapSeqCheck[5] = {0x3B, 0xC3, 0x74, 0x11, 0x50};
+static void map_seq_check_patch(int on)
+{
+    DWORD old;
+    unsigned char b[5];
+    if (on) { b[0] = 0xE9; *(DWORD *)(b + 1) = (DWORD)(0x012c47cf - (ADDR_MAPSEQ_CHECK + 5)); }
+    else memcpy(b, kMapSeqCheck, 5);
+    if (on && memcmp((void *)ADDR_MAPSEQ_CHECK, kMapSeqCheck, 5)) { bot_log("ERROR: map list check - bytes mismatch"); return; }
+    VirtualProtect((void *)ADDR_MAPSEQ_CHECK, 5, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void *)ADDR_MAPSEQ_CHECK, b, 5);
+    VirtualProtect((void *)ADDR_MAPSEQ_CHECK, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_MAPSEQ_CHECK, 5);
+}
+static void level_swap_hook(int on)
+{
+    DWORD old;
+    if (on && !g_swapHooked) {
+        if (memcmp((void *)ADDR_START_LOAD_LEVEL, kStartLoadPrologue, 6)) { bot_log("ERROR: levelswap - startLoadLevel bytes mismatch"); return; }
+        if (!g_swapStub) g_swapStub = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *s = g_swapStub;
+        int k = 0;
+        s[k++] = 0x51;                                                     // push ecx (save)
+        s[k++] = 0x51;                                                     // push ecx (arg)
+        s[k++] = 0xE8; *(DWORD *)(s + k) = (DWORD)((unsigned char *)level_swap - (s + k + 4)); k += 4;   // call level_swap
+        s[k++] = 0x83; s[k++] = 0xC4; s[k++] = 0x04;                       // add esp, 4
+        s[k++] = 0x59;                                                     // pop ecx
+        memcpy(s + k, kStartLoadPrologue, 6); k += 6;                      // sub esp, 134h
+        s[k++] = 0xE9; *(DWORD *)(s + k) = (DWORD)((unsigned char *)ADDR_START_LOAD_LEVEL + 6 - (s + k + 4)); k += 4;   // jmp back
+        FlushInstructionCache(GetCurrentProcess(), s, 64);
+        unsigned char j[6] = {0xE9, 0, 0, 0, 0, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(s - ((unsigned char *)ADDR_START_LOAD_LEVEL + 5));
+        VirtualProtect((void *)ADDR_START_LOAD_LEVEL, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_START_LOAD_LEVEL, j, 6);
+        VirtualProtect((void *)ADDR_START_LOAD_LEVEL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_START_LOAD_LEVEL, 6);
+        map_seq_check_patch(1);
+        g_swapHooked = 1;
+    } else if (!on && g_swapHooked) {
+        VirtualProtect((void *)ADDR_START_LOAD_LEVEL, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_START_LOAD_LEVEL, kStartLoadPrologue, 6);
+        VirtualProtect((void *)ADDR_START_LOAD_LEVEL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_START_LOAD_LEVEL, 6);
+        map_seq_check_patch(0);
+        g_swapHooked = 0;
+    }
+}
+// (diagnostic) who posts the load-level message: COOP_007 loaded, started, and 0.6 s later the load thread posted
+// "Levels/MP_Subway/MP_Subway" again - a reload loop (650 loads). Logs each distinct return address of the post.
+#define ADDR_POST_LOADLEVEL 0x00d61fe0
+static unsigned char *g_postStub;
+static int g_postHooked;
+static void __cdecl post_log(unsigned ret)
+{
+    static unsigned seen[16]; static int n;
+    for (int k = 0; k < n; k++) if (seen[k] == ret) return;
+    if (n < 16) seen[n++] = ret;
+    bot_log("levelswap: Server.LoadLevel posted from %08x", ret);
+}
+static void post_hook(int on)
+{
+    DWORD old;
+    if (on && !g_postHooked) {
+        static const unsigned char kPostPro[6] = {0x81, 0xEC, 0x30, 0x01, 0x00, 0x00};
+        if (memcmp((void *)ADDR_POST_LOADLEVEL, kPostPro, 6)) { bot_log("ERROR: post hook - bytes mismatch"); return; }
+        if (!g_postStub) g_postStub = VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *s = g_postStub; int k = 0;
+        s[k++] = 0x60;                                                          // pushad
+        s[k++] = 0xFF; s[k++] = 0x74; s[k++] = 0x24; s[k++] = 0x20;             // push dword [esp+20h] (the return address)
+        s[k++] = 0xE8; *(DWORD *)(s + k) = (DWORD)((unsigned char *)post_log - (s + k + 4)); k += 4;
+        s[k++] = 0x83; s[k++] = 0xC4; s[k++] = 0x04;                            // add esp,4
+        s[k++] = 0x61;                                                          // popad
+        s[k++] = 0x81; s[k++] = 0xEC; s[k++] = 0x30; s[k++] = 0x01; s[k++] = 0x00; s[k++] = 0x00;   // sub esp,130h
+        s[k++] = 0xE9; *(DWORD *)(s + k) = (DWORD)((unsigned char *)ADDR_POST_LOADLEVEL + 6 - (s + k + 4)); k += 4;
+        FlushInstructionCache(GetCurrentProcess(), s, 64);
+        unsigned char j[6] = {0xE9, 0, 0, 0, 0, 0x90};
+        *(DWORD *)(j + 1) = (DWORD)(s - ((unsigned char *)ADDR_POST_LOADLEVEL + 5));
+        VirtualProtect((void *)ADDR_POST_LOADLEVEL, 6, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void *)ADDR_POST_LOADLEVEL, j, 6);
+        VirtualProtect((void *)ADDR_POST_LOADLEVEL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_POST_LOADLEVEL, 6);
+        g_postHooked = 1;
+    } else if (!on && g_postHooked) {
+        VirtualProtect((void *)ADDR_POST_LOADLEVEL, 6, PAGE_EXECUTE_READWRITE, &old);
+        static const unsigned char kPostPro2[6] = {0x81, 0xEC, 0x30, 0x01, 0x00, 0x00};
+        memcpy((void *)ADDR_POST_LOADLEVEL, kPostPro2, 6);
+        VirtualProtect((void *)ADDR_POST_LOADLEVEL, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)ADDR_POST_LOADLEVEL, 6);
+        g_postHooked = 0;
+    }
+}
+static void cmd_levelswap(const char *a)
+{
+    char from[48] = "", to[48] = "";
+    if (!strncmp(a, "off", 3)) { g_swapFrom[0] = g_swapTo[0] = 0; level_swap_hook(0); post_hook(0); bot_log("levelswap: off"); return; }
+    if (sscanf(a, "%47s %47s", from, to) != 2) { bot_log("usage: levelswap <FROM level> <TO level> | off   (e.g. levelswap MP_Subway COOP_007)"); return; }
+    snprintf(g_swapFrom, sizeof g_swapFrom, "Levels/%s/%s", from, from);
+    snprintf(g_swapTo, sizeof g_swapTo, "Levels/%s/%s", to, to);
+    if (strlen(g_swapTo) > strlen(g_swapFrom)) { bot_log("levelswap: %s is longer than %s - pick a longer FROM level", g_swapTo, g_swapFrom); g_swapFrom[0] = 0; return; }
+    level_swap_hook(1);
+    post_hook(1);
+    bot_log("levelswap: the next load of %s becomes %s%s", g_swapFrom, g_swapTo, g_swapHooked ? "" : " (HOOK FAILED)");
+}
+
+// ---- terrainscan: a map survey with straight-down rays (2026-10-28, for expanding maps past their combat areas) ----
+// terrainscan [half m] [step m] [x z]: a square around the flags' centre (or x z). Per cell: a static ray (no characters) gives the
+// ground, a second ray that skips terrain tells a building / rock / prop from bare terrain. Runs over many ticks on a time budget;
+// writes Battlefield_3_Server\BotMod_terrain_<level>.csv: x,z,y,kind,ny (kind 0 = nothing solid, 1 = terrain, 2 = object; ny =
+// the hit normal's up part, 1 = flat). "terrainscan stop" ends it early (the file keeps the rows done).
+static double perf_now(void);
+static struct { int on, w, n, k, hits[3]; float x0, z0, step, top, bot; double ms, startMs; FILE *f; } g_tscan;
+static void terrainscan_tick(void)
+{
+    if (!g_tscan.on) return;
+    if (!*(void **)ADDR_GAME_WORLD) { bot_log("terrainscan: no game world - stopped"); fclose(g_tscan.f); g_tscan.on = 0; return; }
+    double t0 = perf_now();
+    unsigned saved = g_rayFlags;
+    while (g_tscan.k < g_tscan.n) {
+        if ((g_tscan.k & 63) == 0 && perf_now() - t0 > 4.0) break;   // 4 ms a tick
+        int ix = g_tscan.k % g_tscan.w, iz = g_tscan.k / g_tscan.w;
+        float x = g_tscan.x0 + ix * g_tscan.step, z = g_tscan.z0 + iz * g_tscan.step;
+        float a[3] = {x, g_tscan.top, z}, b[3] = {x, g_tscan.bot, z}, p[3], nrm[3], p2[3];
+        int kind = 0;
+        g_rayFlags = RAY_DONT_CHECK_CHARACTER;
+        if (ray_cast(a, b, p, nrm)) {
+            kind = 1;
+            g_rayFlags = RAY_DONT_CHECK_CHARACTER | 0x08;   // (skip terrain)
+            if (ray_cast(a, b, p2, NULL) && fabsf(p2[1] - p[1]) < 0.5f) kind = 2;
+            fprintf(g_tscan.f, "%.0f,%.0f,%.1f,%d,%.2f\n", x, z, p[1], kind, nrm[1]);
+        } else fprintf(g_tscan.f, "%.0f,%.0f,,0,\n", x, z);
+        g_tscan.hits[kind]++;
+        g_tscan.k++;
+    }
+    g_rayFlags = saved;
+    g_tscan.ms += perf_now() - t0;
+    static unsigned lastLog;
+    if (g_tscan.k >= g_tscan.n || H->frame - lastLog > 300) {
+        lastLog = H->frame;
+        bot_log("terrainscan: %d / %d cells (%.0f%%) - terrain %d, objects %d, nothing %d - %.1f s of ray time", g_tscan.k, g_tscan.n,
+                100.0 * g_tscan.k / g_tscan.n, g_tscan.hits[1], g_tscan.hits[2], g_tscan.hits[0], g_tscan.ms / 1000.0);
+    }
+    if (g_tscan.k >= g_tscan.n) {
+        fclose(g_tscan.f);
+        g_tscan.on = 0;
+        bot_log("terrainscan: done in %.0f s", (perf_now() - g_tscan.startMs) / 1000.0);
+    }
+}
+static void terrainscan_start(const char *args)
+{
+    if (!strncmp(args, "stop", 4)) {
+        if (g_tscan.on) { fclose(g_tscan.f); g_tscan.on = 0; bot_log("terrainscan: stopped at %d / %d", g_tscan.k, g_tscan.n); }
+        return;
+    }
+    if (g_tscan.on) { bot_log("terrainscan: already running (%d / %d) - \"terrainscan stop\" first", g_tscan.k, g_tscan.n); return; }
+    float half = 6000, step = 20, cx = 0, cz = 0;
+    int got = sscanf(args, "%f %f %f %f", &half, &step, &cx, &cz);
+    if (half < 50 || half > 20000 || step < 1 || half / step > 2000) { bot_log("usage: terrainscan [half m (6000)] [step m (20)] [x z] - at most 4000 x 4000 cells"); return; }
+    if (got < 4 && *wanted_bots() == 0 && H->botCount == 0) {   // (idle: the flag list is the last level's - freed objects)
+        bot_log("terrainscan: BotMod is idle (no bots) - give the centre: terrainscan <half> <step> <x> <z>");
+        return;
+    }
+    if (got < 4) {   // the flags' centre
+        int nf = 0;
+        cx = cz = 0;
+        for (int f = 0; f < g_flagCount; f++) { float *fp = flag_pos(f); cx += fp[0]; cz += fp[2]; nf++; }
+        if (nf) { cx /= nf; cz /= nf; }
+    }
+    const char *lv = current_level();
+    char name[64] = "unknown", dir[MAX_PATH], path[MAX_PATH + 96];
+    if (lv) { const char *s = strrchr(lv, '/'); snprintf(name, sizeof name, "%s", s ? s + 1 : lv); }
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    *strrchr(dir, '\\') = 0;
+    snprintf(path, sizeof path, "%s\\BotMod_terrain_%s.csv", dir, name);
+    FILE *f = fopen(path, "w");
+    if (!f) { bot_log("terrainscan: cannot write %s", path); return; }
+    memset(&g_tscan, 0, sizeof g_tscan);
+    g_tscan.f = f;
+    g_tscan.w = (int)(2 * half / step) + 1;
+    g_tscan.n = g_tscan.w * g_tscan.w;
+    g_tscan.x0 = cx - half; g_tscan.z0 = cz - half; g_tscan.step = step;
+    g_tscan.top = 2000; g_tscan.bot = -500;
+    g_tscan.startMs = perf_now();
+    fprintf(f, "# level %s centre %.1f %.1f half %.0f step %.1f\n", name, cx, cz, half, step);
+    if (*wanted_bots() || H->botCount)
+        for (int k = 0; k < g_flagCount; k++) { float *fp = flag_pos(k); fprintf(f, "# flag %d %.1f %.1f %.1f\n", k, fp[0], fp[1], fp[2]); }
+    fprintf(f, "x,z,y,kind,ny\n");
+    g_tscan.on = 1;
+    bot_log("terrainscan: %s - %d x %d cells, %.0f m step, %.1f x %.1f km round (%.0f, %.0f) -> %s", name, g_tscan.w, g_tscan.w, step,
+            2 * half / 1000, 2 * half / 1000, cx, cz, path);
+}
+
 __declspec(dllexport) void botmod_command(char *line)
 {
     bot_log("> %s", line);
@@ -11241,6 +13764,171 @@ __declspec(dllexport) void botmod_command(char *line)
         g_pilotForceExit = 0;
         int ok = enter_vehicle(H->bots[i], best, 0);   // (the driver's / pilot's seat)
         bot_log("board: %s -> the %s %.0f m away (%s)", name, vehicle_name(best), sqrtf(bd), ok && player_vehicle(H->bots[i]) == best ? "in" : "FAILED");
+    } else if (!strncmp(line, "vspawn ", 7)) {   // vspawn <spawner hex> [reset] [near <spawner hex> <metres>]: fire a spawn entity with no player
+        // (an empty vehicle). reset: its spawn count (+0x8c) to 0 first. near: spawn at the other spawner's transform (data+0x10, a
+        // LinearTransform: right, up, forward, position), moved <metres> along its right vector - the spawner's own put back after.
+        // (2026-10-28 co-op: a 2nd AH-1Z on Fire from the Sky, next to the players' one - the spare's own spot is out of bounds)
+        unsigned sp = 0, ref = 0; float side = 25.0f;
+        if (sscanf(line + 7, "%x", &sp) < 1 || IsBadReadPtr((void *)sp, 0x90) || IsBadReadPtr(*(void **)sp, 0x70)) { bot_log("usage: vspawn <spawner hex> [reset] [near <spawner hex> <metres>]"); return; }
+        const char *nr = strstr(line, " near ");
+        if (nr && sscanf(nr + 6, "%x %f", &ref, &side) < 1) ref = 0;
+        unsigned fn = *(unsigned *)(*(unsigned *)sp + 0x6c);
+        if (fn < 0x401000 || fn >= 0x02028000) { bot_log("vspawn: %08x's slot 0x6c (%08x) is not code", sp, fn); return; }
+        char *data = *(char **)(sp + 0x14), *rdata = ref && !IsBadReadPtr((void *)ref, 0x18) ? *(char **)(ref + 0x14) : NULL;
+        float saved[16];
+        int moved = 0;
+        if (rdata && data && !IsBadReadPtr(rdata + 0x10, 64) && !IsBadWritePtr(data + 0x10, 64)) {
+            memcpy(saved, data + 0x10, 64);
+            float *t = (float *)(data + 0x10), *r = (float *)(rdata + 0x10);
+            memcpy(t, r, 64);
+            for (int k = 0; k < 3; k++) t[12 + k] = r[12 + k] + r[k] * side;   // (row 0 = the right vector)
+            moved = 1;
+        }
+        int old = *(int *)(sp + OFF_SPAWNER_COUNT);
+        if (strstr(line, " reset")) *(int *)(sp + OFF_SPAWNER_COUNT) = 0;
+        char *v = ((CseSpawn_t)fn)((void *)sp, NULL, 0xffffffffu, 0, 0);
+        if (moved) {   // (the spawn uses a transform cached at level load, not data+0x10 - so the vehicle itself is moved there)
+            float to[3];
+            for (int k = 0; k < 3; k++) to[k] = ((float *)(data + 0x10))[12 + k];
+            memcpy(data + 0x10, saved, 64);
+            if (v && !IsBadReadPtr(v, 0x200) && *(unsigned *)v == ADDR_VEHICLE_VTABLE && !vehicle_teleport(v, to)) bot_log("vspawn: could not move %p", v);
+        }
+        float *xf = v && !IsBadReadPtr(v, 0x200) && *(unsigned *)v == ADDR_VEHICLE_VTABLE ? vehicle_xf(v) : NULL;
+        bot_log("vspawn: %08x (vt %08x, count %d -> %d)%s -> %p%s at (%.0f, %.0f, %.0f)", sp, *(unsigned *)sp, old, *(int *)(sp + OFF_SPAWNER_COUNT),
+                moved ? " next to the other spawner" : "", v, v && *(unsigned *)v == ADDR_VEHICLE_VTABLE ? " (a vehicle)" : "", xf ? xf[12] : 0, xf ? xf[13] : 0, xf ? xf[14] : 0);
+    } else if (!strncmp(line, "vmove ", 6)) {   // vmove <vehicle hex> <x> <y> <z>: teleport a vehicle's physics body (see vehicle_teleport)
+        unsigned veh = 0; float to[3];
+        if (sscanf(line + 6, "%x %f %f %f", &veh, &to[0], &to[1], &to[2]) != 4) { bot_log("usage: vmove <vehicle hex> <x> <y> <z>"); return; }
+        if (IsBadReadPtr((void *)veh, 0x200) || *(unsigned *)veh != ADDR_VEHICLE_VTABLE) { bot_log("vmove: %08x is not a vehicle", veh); return; }
+        bot_log("vmove: %08x -> (%.0f, %.0f, %.0f): %s", veh, to[0], to[1], to[2], vehicle_teleport((char *)veh, to) ? "moved" : "no rigid body found");
+    } else if (!strncmp(line, "navmax ", 7)) {   // navmax <nodes>: A* expansion cap (0 = defaults)
+        nav_set_max_expanded(atoi(line + 7));
+        bot_log("navmax: A* expansion cap %d (0 = defaults)", atoi(line + 7));
+    } else if (!strncmp(line, "coopsquad", 9)) {   // coopsquad <bots> <vehicle part> <mark> | off: see coop_squad_tick
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strcmp(a, "off")) g_squadN = 0;
+        else if (!strcmp(a, "go")) { g_squadGo = 1; bot_log("coopsquad: the drop starts at the next look (no trigger wait)"); return; }
+        else { g_squadTrig[0] = 0; if (sscanf(a, "%d %31s %63s %31s", &g_squadN, g_squadVeh, g_squadMark, g_squadTrig) < 3) { g_squadN = 0; bot_log("usage: coopsquad <bots> <vehicle part> <mark> [trigger vehicle part] | off"); return; } }
+        bot_log("coopsquad: %s", g_squadN ? "ON" : "OFF");
+        if (g_squadN) bot_log("coopsquad: %d bot(s), a '%s' on the mark '%s' when a mission '%s' comes within 300 m", g_squadN, g_squadVeh, g_squadMark, g_squadTrig[0] ? g_squadTrig : g_squadVeh);
+    } else if (!strncmp(line, "coopobjective", 13)) {   // coopobjective <name> <player> | <name> <x> <y> <z> | clear | (list): the bots' targets
+        const char *a = line + 13 + (line[13] == ' ');
+        char nm[64] = "", who[64] = ""; float p[3];
+        char path[MAX_PATH + 64];
+        botmod_file(path, sizeof path, "coop_marks.txt");
+        if (!strncmp(a, "stage ", 6)) {   // coopobjective stage <n>: jump to stage n (1-based)
+            g_coopStage = atoi(a + 6) - 1;
+            if (g_coopStage < 0) g_coopStage = 0;
+            coop_stage_apply();
+            return;
+        }
+        if (!strcmp(a, "clear")) {   // (comments the level's obj marks out)
+            FILE *f = fopen(path, "r"); char buf[16384]; size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0; if (f) fclose(f); buf[n] = 0;
+            f = fopen(path, "w");
+            for (char *t = strtok(buf, "\n"); f && t; t = strtok(NULL, "\n")) {
+                char lv[64], m[64];
+                if (current_level() && sscanf(t, "%63s %63s", lv, m) == 2 && !_stricmp(lv, current_level()) && !_strnicmp(m, "obj", 3)) fprintf(f, "# %s\n", t);
+                else fprintf(f, "%s\n", t);
+            }
+            if (f) fclose(f);
+        } else if (*a) {
+            if (sscanf(a, "%63s %f %f %f", nm, &p[0], &p[1], &p[2]) == 4) {}
+            else if (sscanf(a, "%63s %63s", nm, who) == 2) {
+                char *pl = find_player(who), *v = pl ? player_vehicle(pl) : NULL;
+                float *x = v ? vehicle_xf(v) : NULL, *hp = pl ? human_pos(pl) : NULL;
+                if (x) memcpy(p, x + 12, 12); else if (hp) memcpy(p, hp, 12); else { bot_log("coopobjective: no player '%s'", who); return; }
+            } else { bot_log("usage: coopobjective <name> <player> | <name> <x> <y> <z> | clear"); return; }
+            if (_strnicmp(nm, "obj", 3)) { char t2[64]; snprintf(t2, sizeof t2, "obj_%s", nm); strcpy(nm, t2); }
+            FILE *f = fopen(path, "a");
+            if (f) { fprintf(f, "%s %s %.2f %.2f %.2f 0\n", current_level() ? current_level() : "?", nm, p[0], p[1], p[2]); fclose(f); }
+        }
+        coop_objectives_load();
+        for (int i = 0; i < H->botCount; i++) { BotBrain *b = bot_brain(i); b->targetFlag = -1; b->replanAt = 0; b->enroute = 0; b->waiting = 0; b->avoidFlag = -1; b->avoidUntil = 0; b->retryAt = 0; }   // (pick again - an objective found unreachable before the nav grid reached it stays avoided otherwise)
+        bot_log("coopobjective: %d objective(s) on %s, stage %d", g_coopObjN, current_level() ? current_level() : "?", g_coopStage + 1);
+    } else if (!strncmp(line, "spawnpos", 8)) {   // spawnpos [spawner hex] | (none: every soldier spawner): the WORLD spawn transform a spawn entity
+        // reports through its own vfuncs (vt+0x58 = the single-transform path's, vt+0x98 = the first one the creator 0x00e59340 asks) -
+        // prefab spawners' data positions are local (0,0,0); this is where they would really put a soldier (2026-10-29: waves per stage)
+        unsigned one = 0;
+        sscanf(line + 8, "%x", &one);
+        char *sp[128];
+        int n = one ? 1 : scan_objects(0x025bbbc0, sp, 128);
+        if (one) sp[0] = (char *)one;
+        typedef char (__attribute__((thiscall)) *GetXf_t)(void *self, float *out);
+        for (int k = 0; k < n; k++) {
+            if (IsBadReadPtr(sp[k], 0x90) || IsBadReadPtr(*(void **)sp[k], 0xa0)) continue;
+            char *d = *(char **)(sp[k] + 0x14);
+            int team = d && !IsBadReadPtr(d, 0x190) ? *(int *)(d + 0x128) : -1, pt = d && !IsBadReadPtr(d, 0x190) ? *(int *)(d + 0x180) : -1;
+            __attribute__((aligned(16))) float a[16], b[16];
+            memset(a, 0, sizeof a); memset(b, 0, sizeof b);
+            ((GetXf_t)(*(unsigned **)sp[k])[0x58 / 4])(sp[k], a);
+            ((GetXf_t)(*(unsigned **)sp[k])[0x98 / 4])(sp[k], b);
+            bot_log("spawnpos: %p team %d ptype %d count %d - vt58 (%.0f, %.0f, %.0f) vt98 (%.0f, %.0f, %.0f) %s", sp[k], team, pt, *(int *)(sp[k] + OFF_SPAWNER_COUNT),
+                    a[12], a[13], a[14], b[12], b[13], b[14], d ? asset_name(*(void **)(d + 0x50)) : "?");
+        }
+    } else if (!strncmp(line, "coopmark ", 9)) {   // coopmark <name> <player>: record that player's vehicle (or soldier) spot + facing
+        char nm[64] = "", who[64] = "";
+        if (sscanf(line + 9, "%63s %63s", nm, who) != 2) { bot_log("usage: coopmark <name> <player>"); return; }
+        char *pl = find_player(who), *v = pl ? player_vehicle(pl) : NULL;
+        float *x = v ? vehicle_xf(v) : NULL, pos[3], yaw = 0;
+        if (x) { memcpy(pos, x + 12, 12); yaw = atan2f(x[8], x[10]) * 180.0f / 3.14159265f; }
+        else if (pl && human_pos(pl)) memcpy(pos, human_pos(pl), 12);
+        else { bot_log("coopmark: no player '%s'", who); return; }
+        char path[MAX_PATH + 64];
+        botmod_file(path, sizeof path, "coop_marks.txt");
+        FILE *f = fopen(path, "a");
+        if (f) { fprintf(f, "%s %s %.2f %.2f %.2f %.1f\n", current_level() ? current_level() : "?", nm, pos[0], pos[1], pos[2], yaw); fclose(f); }
+        bot_log("coopmark: %s = (%.2f, %.2f, %.2f) yaw %.1f on %s -> coop_marks.txt", nm, pos[0], pos[1], pos[2], yaw, current_level() ? current_level() : "?");
+    } else if (!strncmp(line, "coopplace ", 10)) {   // coopplace <vehicle hex> <mark>: put a vehicle on a recorded mark (level, its facing)
+        char nm[64] = ""; unsigned veh = 0; float pos[3], yaw;
+        if (sscanf(line + 10, "%x %63s", &veh, nm) != 2) { bot_log("usage: coopplace <vehicle hex> <mark>"); return; }
+        if (IsBadReadPtr((void *)veh, 0x200) || *(unsigned *)veh != ADDR_VEHICLE_VTABLE) { bot_log("coopplace: %08x is not a vehicle", veh); return; }
+        if (!coop_mark_get(nm, pos, &yaw)) { bot_log("coopplace: no mark '%s' for this level in coop_marks.txt", nm); return; }
+        bot_log("coopplace: %08x -> %s (%.2f, %.2f, %.2f) yaw %.1f: %s", veh, nm, pos[0], pos[1], pos[2], yaw, vehicle_teleport_yaw((char *)veh, pos, yaw) ? "placed" : "no rigid body");
+    } else if (!strncmp(line, "vnear ", 6)) {   // vnear <vehicle hex> <player>: move a vehicle onto a clear spot beside that player's vehicle
+        char who[64] = ""; unsigned veh = 0;
+        if (sscanf(line + 6, "%x %63s", &veh, who) != 2) { bot_log("usage: vnear <vehicle hex> <player>"); return; }
+        char *pl = find_player(who), *ref = pl ? player_vehicle(pl) : NULL;
+        if (!ref || IsBadReadPtr((void *)veh, 0x200) || *(unsigned *)veh != ADDR_VEHICLE_VTABLE) { bot_log("vnear: need a vehicle and a player in one"); return; }
+        float to[3];
+        if (!vehicle_clear_spot(ref, to)) { bot_log("vnear: no clear spot beside %s", who); return; }
+        bot_log("vnear: %08x -> (%.0f, %.0f, %.0f) beside %s: %s", veh, to[0], to[1], to[2], who, vehicle_teleport_like((char *)veh, ref, to) ? "moved" : "no rigid body");
+    } else if (!strncmp(line, "coopdrop ", 9)) {   // coopdrop <player> <vehicle spawner hex> [bot names...]: a transport next to that player's
+        // vehicle (vehicle_clear_spot: footprint rays on the same pad / ground, its facing), the bots seated in it and out again - a
+        // squad put down beside a player (2026-10-29 co-op: Fire from the Sky's LZ; the user's idea - a Huey drops BotMod's bots off).
+        char who[64] = "", rest[256] = ""; unsigned sp = 0;
+        if (sscanf(line + 9, "%63s %x %255[^\n]", who, &sp, rest) < 2) { bot_log("usage: coopdrop <player> <vehicle spawner hex> [bot ...]"); return; }
+        char *pl = find_player(who), *ref = pl ? player_vehicle(pl) : NULL;
+        if (!ref) { bot_log("coopdrop: %s is not in a vehicle (the drop goes next to it)", who); return; }
+        if (IsBadReadPtr((void *)sp, 0x90) || IsBadReadPtr(*(void **)sp, 0x70)) { bot_log("coopdrop: %08x is not a spawner", sp); return; }
+        float to[3];
+        if (!vehicle_clear_spot(ref, to)) { bot_log("coopdrop: no clear spot next to %s", who); return; }
+        unsigned fn = *(unsigned *)(*(unsigned *)sp + 0x6c);
+        *(int *)(sp + OFF_SPAWNER_COUNT) = 0;
+        char *v = ((CseSpawn_t)fn)((void *)sp, NULL, 0xffffffffu, 0, 0);
+        if (!v || IsBadReadPtr(v, 0x200) || *(unsigned *)v != ADDR_VEHICLE_VTABLE) { bot_log("coopdrop: spawner %08x made no vehicle", sp); return; }
+        if (!vehicle_teleport_like(v, ref, to)) vehicle_teleport(v, to);
+        bot_log("coopdrop: a %s next to %s at (%.0f, %.0f, %.0f)", vehicle_name(v), who, to[0], to[1], to[2]);
+        int seat = 1;
+        for (char *t = strtok(rest, " "); t; t = strtok(NULL, " ")) {
+            int i = bot_index(find_player(t));
+            if (i < 0 || !*(void **)(H->bots[i] + OFF_PLAYER_SOLDIER)) { bot_log("coopdrop: '%s' is not a living bot", t); continue; }
+            ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(H->bots[i], 1);   // (keyframed transports: see coop_squad_tick)
+            char ok = ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(H->bots[i], v, seat);
+            if (ok && player_vehicle(H->bots[i]) == v) { g_pilotForceExit = 1; bot_exit_vehicle(i, 1); g_pilotForceExit = 0; }
+            ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(H->bots[i], 0);
+            bot_log("coopdrop: %s %s", t, ok ? (player_vehicle(H->bots[i]) ? "seated, not out" : "dropped off") : "refused");
+            seat++;
+        }
+    } else if (!strncmp(line, "seatin ", 7)) {   // seatin <player> <vehicle hex> [seat]: put a living player (humans too) in that seat
+        char name[64] = ""; unsigned veh = 0; int seat = -1;   // (2026-10-28 co-op: Fire from the Sky's 2-seat AH-1Z - a spare one)
+        if (sscanf(line + 7, "%63s %x %d", name, &veh, &seat) < 2) { bot_log("usage: seatin <player> <vehicle hex> [seat]"); return; }
+        char *pl = !strncmp(name, "0x", 2) ? (char *)strtoul(name, NULL, 16) : find_player(name);   // (0x<player>: the mission's nameless AI)
+        if (!pl || IsBadReadPtr(pl, 0x400) || !*(void **)(pl + OFF_PLAYER_SOLDIER)) { bot_log("seatin: '%s' is not a living player", name); return; }
+        if (IsBadReadPtr((void *)veh, 0x200) || *(unsigned *)veh != ADDR_VEHICLE_VTABLE) { bot_log("seatin: %08x is not a vehicle", veh); return; }
+        if (seat < 0) seat = free_seat((char *)veh);
+        if (seat < 0) { bot_log("seatin: %08x is full", veh); return; }
+        char ok = ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(pl, (void *)veh, seat);
+        bot_log("seatin: %s -> %08x seat %d: %s (in %p)", name, veh, seat, ok ? "ok" : "refused", player_vehicle(pl));
     } else if (!strncmp(line, "exit ", 5)) {
         int i = bot_index(find_player(line + 5));
         if (i >= 0 && !*(char **)(H->bots[i] + OFF_PLAYER_SOLDIER)) { bot_log("exit: %s is dead - nothing to get out of", line + 5); return; }   // (an exit sent to a
@@ -11252,23 +13940,191 @@ __declspec(dllexport) void botmod_command(char *line)
         char name[64] = ""; unsigned tgt = 0, arg = 1;     // (vslot 0x6c (player, -1, arg, 0) on the target - e.g. a jet spawner)
         if (sscanf(line + 9, "%63s %x %x", name, &tgt, &arg) < 2) { bot_log("usage: spawnvia <bot> <target hex> [arg hex]"); return; }
         char *bot = find_player(name);
-        if (!bot || !is_bot(bot)) { bot_log("spawnvia: '%s' is not a bot", name); return; }
+        // (2026-10-28: humans too - co-op's 3rd player gets no soldier (the mission spawns 2) and sits in a free camera; spawning
+        //  him through the co-op spawner (CoopSoldier) puts him in. A human keeps his own kit; his blueprint, if none, is copied
+        //  from a team-mate who has one.)
+        int human = bot && (!is_bot(bot) || strstr(line, " raw"));   // (raw: a bot spawned as the spawner makes it - its own soldier,
+                                                                     //  kit; no BotMod kit / level-ready wait - co-op levels, 2026-10-29)
+        if (!bot) { bot_log("spawnvia: no player '%s'", name); return; }
         if (*(void **)(bot + OFF_PLAYER_SOLDIER)) { bot_log("spawnvia: '%s' is alive", name); return; }
-        if (!g_levelReady) { bot_log("spawnvia: waits - level not ready (its kits are not looked up yet)"); return; }
-        if (!*(void **)(bot + OFF_PLAYER_BLUEPRINT)) {   // no SoldierBlueprint (a bot never spawned by "spawn"): the game does
+        if (human && !*(void **)(bot + OFF_PLAYER_BLUEPRINT) && 0) {   // (co-op players have no blueprint either - the CoopSoldier spawner brings its own)
+            char *pm = player_manager();
+            void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+            unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+            for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+                char *o = arr[k];
+                if (o && o != bot && *(void **)(o + OFF_PLAYER_SOLDIER) && *(void **)(o + OFF_PLAYER_BLUEPRINT) && player_team(o) == player_team(bot) && !o[OFF_PLAYER_IS_AI]) {
+                    ((SetPtr_t)ADDR_PLAYER_SET_BLUEPRINT)(bot, *(void **)(o + OFF_PLAYER_BLUEPRINT));
+                    bot_log("spawnvia: '%s' given %s's SoldierBlueprint", name, o + OFF_PLAYER_ONLINE_NAME);
+                    break;
+                }
+            }
+        }
+        if (!human && !g_levelReady) { bot_log("spawnvia: waits - level not ready (its kits are not looked up yet)"); return; }
+        if (!human && !*(void **)(bot + OFF_PLAYER_BLUEPRINT)) {   // no SoldierBlueprint (a bot never spawned by "spawn"): the game does
             int team = player_team(bot) == 2 ? 2 : 1;     // not create the soldier - every jet spawner returned NULL (2026-10-13)
             if (!H->teamBlueprint[team]) { bot_log("spawnvia: no SoldierBlueprint known for team %d yet", team); return; }
             ((SetPtr_t)ADDR_PLAYER_SET_BLUEPRINT)(bot, H->teamBlueprint[team]);
             bot_log("spawnvia: '%s' given the team %d SoldierBlueprint", name, team);
         }
-        if (!spawn_blueprint_ok(bot, player_team(bot) == 2 ? 2 : 1, "spawnvia")) return;
+        if (!human && !spawn_blueprint_ok(bot, player_team(bot) == 2 ? 2 : 1, "spawnvia")) return;
         if (!tgt || IsBadReadPtr((void *)tgt, 4) || IsBadReadPtr(*(void **)tgt, 0x70)) { bot_log("spawnvia: %08x is not an object", tgt); return; }
         unsigned fn = *(unsigned *)(*(unsigned *)tgt + 0x6c);
         if (fn < 0x401000 || fn >= 0x02028000) { bot_log("spawnvia: %08x's slot 0x6c (%08x) is not code", tgt, fn); return; }
-        apply_kit(bot);
+        if (!human) apply_kit(bot);
         void *r = ((CseSpawn_t)fn)((void *)tgt, bot, 0xffffffffu, arg, 0);
         bot_log("spawnvia: '%s' via %08x (vt %08x, fn %08x, arg %x) -> %p, soldier %p, vehicle %p", name, tgt, *(unsigned *)tgt, fn, arg, r,
                 *(void **)(bot + OFF_PLAYER_SOLDIER), player_vehicle(bot));
+    } else if (!strncmp(line, "swaphold", 8)) {   // swaphold on|off: keep the server on the level swap's TO level (see swap_hold_tick)
+        const char *a = line + 8 + (line[8] == ' ');
+        if (!strcmp(a, "on")) g_swapHold = 1; else if (!strcmp(a, "off")) g_swapHold = 0;
+        bot_log("swaphold: %s", g_swapHold ? "ON - not on the swapped level -> next round" : "OFF");
+    } else if (!strncmp(line, "coopbotai ", 10)) {   // coopbotai 0|1 (see coop_bot_spawn)
+        g_coopBotAI = atoi(line + 10) != 0;
+        bot_log("coopbotai: squad bots spawn with the AI flag %s", g_coopBotAI ? "ON" : "OFF");
+    } else if (!strncmp(line, "coopbotgod ", 11)) {   // coopbotgod on|off (see g_coopBotGod)
+        g_coopBotGod = !strcmp(line + 11, "on");
+        bot_log("coopbotgod: squad bots on co-op levels %s", g_coopBotGod ? "take NO damage" : "take damage");
+    } else if (!strncmp(line, "coopbottype ", 12)) {   // coopbottype <PlayerType>: see g_coopBotType
+        g_coopBotType = atoi(line + 12);
+        bot_log("coopbottype: squad bots spawn through friendly spawners of PlayerType %d", g_coopBotType);
+    } else if (!strncmp(line, "coopbotbp", 9)) {   // coopbotbp [<blueprint part> | off]: see g_coopBotBp; no argument lists the soldier blueprints
+        const char *a = line + 9 + (line[9] == ' ');
+        if (*a) { snprintf(g_coopBotBp, sizeof g_coopBotBp, "%s", strcmp(a, "off") ? a : ""); bot_log("coopbotbp: '%s'", g_coopBotBp); }
+        else {
+            char *sp[128];
+            int n = scan_objects(0x025bbbc0, sp, 128);
+            for (int k = 0; k < n; k++) {
+                char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+                if (!d || IsBadReadPtr(d, 0x190)) continue;
+                bot_log("coopbotbp: spawner %p team %d type %d bp %s", sp[k], *(int *)(d + 0x128), *(int *)(d + 0x180), asset_name(*(void **)(d + 0x50)));
+            }
+        }
+    } else if (!strncmp(line, "coopstall", 9)) {   // coopstall <seconds> [radius] | off (see coop_stall_tick)
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strcmp(a, "off")) g_coopStallSec = 0;
+        else if (*a) { int sec = 0, rad = 0; if (sscanf(a, "%d %d", &sec, &rad) >= 1) { g_coopStallSec = sec; if (rad > 0) g_coopStallRadius = rad; } }
+        bot_log("coopstall: %s, radius %d m, %ld enemy(ies) killed so far", g_coopStallSec ? "ON" : "OFF", g_coopStallRadius, g_coopStallKills);
+        if (g_coopStallSec) bot_log("coopstall: after %d s with no enemy dying / closing in", g_coopStallSec);
+    } else if (!strncmp(line, "killteam ", 9)) {   // killteam <team> [near <x> <z> <metres>]: every live soldier of that team (soldier +0xd8)
+        // dies (its own suicide call, like kill) - co-op: mission enemies stuck where nobody can reach them (Exfiltration 2026-10-30:
+        // out of bounds / upper floors, they cannot walk out yet) so the mission's "all dead" step can run
+        int t = atoi(line + 9), n = 0; float nx = 0, nz = 0, nr = 0;
+        const char *nr_s = strstr(line, " near ");
+        if (nr_s) sscanf(nr_s + 6, "%f %f %f", &nx, &nz, &nr);
+        char *so[256];
+        int ns = scan_objects(ADDR_SOLDIER_VTABLE, so, 256);
+        for (int k = 0; k < ns; k++) {
+            if (IsBadReadPtr(so[k], 0x4c0) || *(int *)(so[k] + 0xd8) != t || *(float *)(so[k] + OFF_SOLDIER_HEALTH) <= 0) continue;
+            float *p = (float *)(so[k] + OFF_SOLDIER_SPAWN_POSITION);
+            if (nr > 0 && (p[0] - nx) * (p[0] - nx) + (p[2] - nz) * (p[2] - nz) > nr * nr) continue;
+            typedef void (__attribute__((thiscall)) *Kill_t)(void *soldier, int arg);
+            ((Kill_t)(*(void ***)so[k])[0x170 / 4])(so[k], 0);
+            bot_log("killteam: soldier %p of team %d at (%.0f, %.0f, %.0f) killed", so[k], t, p[0], p[1], p[2]);
+            n++;
+        }
+        bot_log("killteam: %d soldier(s) of team %d killed", n, t);
+    } else if (!strncmp(line, "coopwaves ", 10)) {   // coopwaves on|off
+        g_coopWavesOff = !strcmp(line + 10, "off");
+        bot_log("coopwaves: %s", g_coopWavesOff ? "OFF" : "ON");
+    } else if (!strncmp(line, "orders", 6) || !strncmp(line, "orderissue ", 11)) {
+        // orders: the mission's ServerPatrolOrderEntity objects (vt 0x0263d5b8; data at +0x10, IssueOrderDelay data+0x10).
+        // orderissue <hex|all>: what its IssueOrder event (0xd2199312) does with no delay - 0x01ba08a0(order, 0): resolves the order's
+        // "Soldiers" link (the enemy spawners) and orders them (spawning them? - 2026-10-29 research: the mission never sends these
+        // wave spawners "Spawn", only IssueOrder to the PatrolOrder linked to them). Logs every enemy spawner whose count changed.
+        static char *ord[96]; static int nord;
+        nord = scan_objects(0x0263d5b8, ord, 96);
+        if (!strncmp(line, "orders", 6) && line[6] != 'i') {
+            for (int k = 0; k < nord; k++) {
+                char *d = *(char **)(ord[k] + 0x10);
+                bot_log("orders: %p data %p delay %.1f readiness %d enabled %d", ord[k], d, d ? *(float *)(d + 0x10) : -1, d ? *(int *)(d + 0x1c) : -1, d ? *(int *)(d + 0x20) : -1);
+            }
+            bot_log("orders: %d", nord);
+        } else {
+            unsigned a = 0; int all = strstr(line, " all") != NULL;
+            if (!all) sscanf(line + 11, "%x", &a);
+            char *sp[160]; int nsp = scan_objects(0x025bbbc0, sp, 160), before[160];
+            for (int q = 0; q < nsp; q++) before[q] = *(int *)(sp[q] + OFF_SPAWNER_COUNT);
+            for (int k = 0; k < nord; k++) {
+                if (!all && (unsigned)ord[k] != a) continue;
+                typedef void (__attribute__((thiscall)) *Issue_t)(void *self, int later);
+                ((Issue_t)0x01ba08a0)(ord[k], 0);
+                bot_log("orderissue: %p issued", ord[k]);
+            }
+            for (int q = 0; q < nsp; q++)
+                if (*(int *)(sp[q] + OFF_SPAWNER_COUNT) != before[q]) bot_log("orderissue: spawner %p count %d -> %d", sp[q], before[q], *(int *)(sp[q] + OFF_SPAWNER_COUNT));
+        }
+    } else if (!strcmp(line, "coopdiag")) {   // coopdiag: each bot's input / soldier, and the stage wave's enemies (2026-10-29)
+        // (singleStep 0x00e009c0 steps a soldier only if its entry[0] (+0xfc vector) -> +0x4c player has +0x3e8 == the soldier;
+        //  the input is that player's +0x3c0 - why do the AISoldier bots not move?)
+        char *pls[80]; int np = 0;
+        for (int i = 0; i < H->botCount && i < MAX_BOTS && np < 80; i++) pls[np++] = H->bots[i];
+        for (int e = 0; e < g_stageEnemyN && np < 80; e++) if (g_stageEnemy[e]) pls[np++] = g_stageEnemy[e];
+        for (int q = 0; q < np; q++) {
+            char *pl = pls[q], *so = !IsBadReadPtr(pl, 0x400) ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
+            char *e0 = NULL, *epl = NULL, *ectl = NULL; unsigned ne = 0;
+            if (so && !IsBadReadPtr(so + 0xfc, 8)) {
+                char **b0 = *(char ***)(so + 0xfc), **b1 = *(char ***)(so + 0x100);
+                ne = b0 ? (unsigned)(b1 - b0) : 0;
+                if (ne && !IsBadReadPtr(b0, 4)) e0 = b0[0];
+                if (e0 && !IsBadReadPtr(e0 + 0x4c, 4)) epl = *(char **)(e0 + 0x4c);
+                if (epl && !IsBadReadPtr(epl + 0x3e8, 4)) ectl = *(char **)(epl + 0x3e8);
+            }
+            bot_log("coopdiag: step %s pl=%p ai=%d ctl=%p in=%p soldier=%p entries=%u e0=%p e0.pl=%p e0.pl.ctl=%p sp=%08x", q < H->botCount ? pl + OFF_PLAYER_ONLINE_NAME : "enemy",
+                    pl, pl[OFF_PLAYER_IS_AI], *(char **)(pl + 0x3e8), *(char **)(pl + OFF_PLAYER_INPUT), so, ne, e0, epl, ectl, so ? *(unsigned *)(so + 0x1d4) : 0);
+        }
+        for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+            char *b = H->bots[i], *in = *(char **)(b + OFF_PLAYER_INPUT), *so = *(char **)(b + OFF_PLAYER_SOLDIER);
+            float *p = so ? (float *)(so + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+            bot_log("coopdiag: %s ai=%d team=%d input=%p thr=%.2f dt=%.4f soldier=%p vt=%08x pos=(%.1f %.1f %.1f) veh=%p", b + OFF_PLAYER_ONLINE_NAME,
+                    b[OFF_PLAYER_IS_AI], player_team(b), in, in ? *(float *)(in + 0x10) : 0, in ? *(float *)(in + 0x1ec) : 0, so,
+                    so ? *(unsigned *)so : 0, p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, player_vehicle(b));
+        }
+        for (int e = 0; e < g_stageEnemyN; e++) {
+            char *o = g_stageEnemy[e], *so = o && !IsBadReadPtr(o, 0x400) ? *(char **)(o + OFF_PLAYER_SOLDIER) : NULL;
+            float *p = so ? (float *)(so + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+            bot_log("coopdiag: enemy %d %p team=%d soldier=%p pos=(%.1f %.1f %.1f)", e, o, o ? player_team(o) : -1, so, p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0);
+        }
+    } else if (!strcmp(line, "levelinfo")) {   // levelinfo: why BotMod's level is (not) ready (2026-10-29 co-op)
+        bot_log("levelinfo: level '%s' (current %s) ready %d, job state %ld (level '%s'), check at %u (frame %u), flags %d, hq %d, blueprint %p, loadouts %d, needLoadouts %d",
+                g_level, current_level() ? current_level() : "-", g_levelReady, (long)g_jobState, g_jobLevel, g_levelCheckAt, H->frame, g_flagCount, g_jobHq,
+                g_jobBlueprint, loadout_lib()->count, g_needLoadouts);
+    } else if (!strncmp(line, "coopboard", 9)) {   // coopboard on|off: see coop_board_tick
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strncmp(a, "on", 2)) {
+            g_coopBoard = 1;
+            g_coopBoardLevels[0] = 0;
+            if (a[2] == ' ') snprintf(g_coopBoardLevels, sizeof g_coopBoardLevels, " %s ", a + 3);   // (" COOP_006 COOP_009 ")
+        } else if (!strcmp(a, "off")) g_coopBoard = 0;
+        bot_log("coopboard: %s%s", g_coopBoard ? "ON - idle mission AI next to an empty vehicle (40 m) are seated in it" : "OFF",
+                g_coopBoard && g_coopBoardLevels[0] ? g_coopBoardLevels : "");
+    } else if (!strncmp(line, "coopvehicle", 11)) {   // coopvehicle on|off: see coop_vehicle_for
+        const char *a = line + 11 + (line[11] == ' ');
+        if (!strncmp(a, "max ", 4)) { g_coopMaxViper = atoi(a + 4); bot_log("coopvehicle: up to %d extra helicopter(s), the rest on foot at the LZ", g_coopMaxViper); return; }
+        if (!strncmp(a, "give ", 5)) {   // coopvehicle give <player>: the same now, by hand (tests)
+            char *pl = find_player(a + 5);
+            if (!pl || !*(void **)(pl + OFF_PLAYER_SOLDIER)) { bot_log("coopvehicle: '%s' is not a living player", a + 5); return; }
+            if (!coop_vehicle_for(pl)) bot_log("coopvehicle: nothing done for %s (no team-mate in a full vehicle?)", a + 5);
+            return;
+        }
+        if (!strcmp(a, "on")) g_coopVehicle = 1; else if (!strcmp(a, "off")) g_coopVehicle = 0;
+        bot_log("coopvehicle: %s", g_coopVehicle ? "ON - a just-spawned human whose team-mates' vehicle is full gets his own next to it" : "OFF");
+    } else if (!strncmp(line, "coopspawn", 9)) {   // coopspawn <player> | coopspawn auto on|off | coopspawn list
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strcmp(a, "auto on")) { g_coopAuto = 1; bot_log("coopspawn: auto ON - humans without a soldier on a co-op level spawn after %.1f s", g_coopDelayMs / 1000.0); }
+        else if (!strncmp(a, "delay ", 6)) { g_coopDelayMs = (int)(atof(a + 6) * 1000); if (g_coopDelayMs < 0) g_coopDelayMs = 0; bot_log("coopspawn: delay %.1f s", g_coopDelayMs / 1000.0); }
+        else if (!strcmp(a, "auto off")) { g_coopAuto = 0; bot_log("coopspawn: auto OFF"); }
+        else if (!strcmp(a, "list") || !*a) {
+            coop_find_spawners();
+            for (int k = 0; k < g_coopSpN; k++) bot_log("coopspawn: %p %s, count %d", g_coopSp[k], asset_name(*(void **)(*(char **)(g_coopSp[k] + 0x14) + 0x188)),
+                                                    *(int *)(g_coopSp[k] + OFF_SPAWNER_COUNT));
+            bot_log("coopspawn: %d co-op spawner(s), auto %s", g_coopSpN, g_coopAuto ? "ON" : "OFF");
+        } else {
+            char *pl = find_player(a);
+            if (!pl) bot_log("coopspawn: no player '%s'", a);
+            else if (*(void **)(pl + OFF_PLAYER_SOLDIER)) bot_log("coopspawn: %s is alive", a);
+            else { g_coopSpN = 0; coop_spawn_one(pl, 0); }
+        }
     } else if (!strncmp(line, "spawnlist", 9)) {   // spawnlist: every soldier spawn entity - its data's team byte, tied to a capture point or not
         char *sp[128], *cps[MAX_FLAGS * 2];
         int n = scan_objects(0x025bbbc0, sp, 128), ncp = scan_objects(ADDR_CAPTURE_POINT_VTABLE, cps, MAX_FLAGS * 2), counts[8] = {0};
@@ -12033,14 +14889,19 @@ __declspec(dllexport) void botmod_command(char *line)
         g_rayFlags = saved;
         bot_log("%s", out);
     } else if (!strncmp(line, "squadspawn ", 11)) {   // squadspawn <bot#> <player>: spawn a dead bot on a squadmate (research)
+        // (2026-10-28: or <player name> - co-op's 3rd human, who has no soldier: the co-op spawners refuse him)
         int i = -1, used = 0;
-        if (sscanf(line + 11, "%d %n", &i, &used) < 1 || i < 0 || i >= H->botCount) { bot_log("usage: squadspawn <bot#> <squadmate>"); return; }
-        char *bot = H->bots[i], *mate = find_player(line + 11 + used);
+        char who[64] = "", *bot = NULL;
+        if (sscanf(line + 11, "%d %n", &i, &used) >= 1 && i >= 0 && i < H->botCount) bot = H->bots[i];
+        else if (sscanf(line + 11, "%63s %n", who, &used) >= 1) bot = find_player(who);
+        if (!bot) { bot_log("usage: squadspawn <bot# | player> <squadmate>"); return; }
+        int human = !is_bot(bot);
+        char *mate = find_player(line + 11 + used);
         if (!mate) { bot_log("squadspawn: no player '%s'", line + 11 + used); return; }
         if (*(void **)(bot + OFF_PLAYER_SOLDIER)) { bot_log("squadspawn: %s is alive - kill it first", bot + OFF_PLAYER_ONLINE_NAME); return; }
         int team = player_team(bot) == 2 ? 2 : 1;
-        if (!*(void **)(bot + OFF_PLAYER_BLUEPRINT) && H->teamBlueprint[team]) ((SetPtr_t)ADDR_PLAYER_SET_BLUEPRINT)(bot, H->teamBlueprint[team]);
-        apply_kit(bot);
+        if (!human && !*(void **)(bot + OFF_PLAYER_BLUEPRINT) && H->teamBlueprint[team]) ((SetPtr_t)ADDR_PLAYER_SET_BLUEPRINT)(bot, H->teamBlueprint[team]);
+        if (!human) apply_kit(bot);
         typedef char (__attribute__((thiscall)) *SpawnOnSquad_t)(void *extent, void *mate);
         int extentOff = *(int *)0x0285bad8;   // ServerPlayer -> its VeniceServerPlayerExtent
         char r = ((SpawnOnSquad_t)0x01185b50)(bot + extentOff, mate);
@@ -12052,6 +14913,357 @@ __declspec(dllexport) void botmod_command(char *line)
     } else if (!strcmp(line, "ladders")) {   // (re)scan this level's ladders, list and link them
         find_ladders();
         ladders_link();
+    } else if (!strncmp(line, "combatarea", 10)) {   // combatarea off|on: the out-of-bounds kill (see combat_area_tick)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "hold off")) { g_caHold = 1; *combat_area_off() = 1; bot_log("combatarea: hold OFF - stays off whatever borders.txt says"); }
+        else if (!strcmp(a, "hold none")) { g_caHold = 0; bot_log("combatarea: hold released"); return; }
+        else if (!strcmp(a, "off")) *combat_area_off() = 1;
+        else if (!strcmp(a, "on")) *combat_area_off() = 0;
+        else { bot_log("combatarea: %s (usage: combatarea off|on)", *combat_area_off() == 1 ? "OFF" : "ON"); return; }
+        combat_area_tick();
+    } else if (!strncmp(line, "borders", 7)) {   // borders on|off: the game's out-of-bounds rule with BotMod's border (see border_inside)
+        const char *a = line + 7 + (line[7] == ' ');
+        if (!strcmp(a, "on")) { *borders_on() = 1; *combat_area_off() = 0; combat_area_tick(); }
+        else if (!strcmp(a, "off")) *borders_on() = 0;
+        else if (!strncmp(a, "ledge", 5)) {
+            float m = g_zoneLedgeMin; int k = g_zoneLedgeCount;
+            sscanf(a + 5, "%f %d", &m, &k);
+            if (m < 0.05f || m > 3.0f || k < 1 || k > 20) { bot_log("usage: borders ledge <m 0.05-3> <count 1-20>"); return; }
+            g_zoneLedgeMin = m; g_zoneLedgeCount = k;
+            char path[MAX_PATH + 64]; zone_path(path, sizeof path); DeleteFileA(path); g_zone.tree = NULL; g_zone.level[0] = 0;
+            bot_log("borders: a cell is coarse with %d+ ledge(s) of %.2f m+ - surveying again", k, m);
+            return;
+        }
+        else if (!strcmp(a, "rebuild")) { char path[MAX_PATH + 64]; zone_path(path, sizeof path); DeleteFileA(path); g_zone.tree = NULL; g_zone.level[0] = 0; bot_log("borders: the zone map will be surveyed again"); return; }
+        else {
+            bot_log("borders: %s - zone %s %s (%d / %d cells)", *borders_on() == 1 ? "ON" : "OFF", g_zone.level, g_zone.ready ? "ready" : "not ready",
+                    g_zone.k, g_zone.w * g_zone.w);
+            return;
+        }
+        borders_tick();
+    } else if (!strncmp(line, "zonemap", 7)) {   // zonemap: the zone map in the log (rows z high -> low; . smooth, # coarse, ~ water, - flat, blank none)
+        if (!g_zone.ready) { bot_log("zonemap: not ready (%d / %d cells)", g_zone.k, g_zone.w * g_zone.w); return; }
+        for (int iz = g_zone.w - 1; iz >= 0; iz -= 2) {
+            char row[ZONE_MAX + 1];
+            int n = 0;
+            for (int ix = 0; ix < g_zone.w; ix++) row[n++] = " .#~- "[g_zone.c[iz * g_zone.w + ix] <= ZC_NONE ? g_zone.c[iz * g_zone.w + ix] : 0];
+            row[n] = 0;
+            bot_log("zonemap z %6.0f %s", g_zone.z0 + (iz + 0.5f) * g_zone.cell, row);
+        }
+    } else if (!strncmp(line, "eventtrace", 10)) {   // eventtrace on [<type part | guid prefix>] | off (see on_fire_event)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strncmp(a, "on", 2)) {
+            fire_event_hook(1); g_eventTrace = 1; g_eventLogged = 0;
+            snprintf(g_eventTraceFilter, sizeof g_eventTraceFilter, "%s", a[2] == ' ' ? a + 3 : "");
+            bot_log("eventtrace: ON%s%s (up to 20000 lines)", g_eventTraceFilter[0] ? " - only " : "", g_eventTraceFilter);
+        } else if (!strcmp(a, "off")) { g_eventTrace = 0; if (!g_eventDropN) fire_event_hook(0); bot_log("eventtrace: OFF (%ld logged)", g_eventLogged); }
+        else bot_log("usage: eventtrace on [filter] | off");
+    } else if (!strncmp(line, "eventfire ", 10)) {   // eventfire <guid hex prefix> <event id hex>: fire that output as the data instance
+        // (it must have fired once since the hook went in - its bus is remembered; e.g. Exfiltration's AB01 street kill counter
+        //  MultipleTrigger 4761f303 OnTrigger 75c0d0dc = "CONVOY MOVES" without the 22 kills the stuck AI never gave, 2026-10-30)
+        char gp[40] = ""; unsigned id = 0;
+        if (sscanf(line + 10, "%39s %x", gp, &id) != 2) { bot_log("usage: eventfire <guid hex prefix> <event id hex>"); return; }
+        char *data = NULL, *bus = NULL, g[40];
+        for (int k = 0; k < g_seenN && !data; k++) { data_guid_hex(g_seenData[k], g); if (g[0] && !strncmp(g, gp, strlen(gp))) { data = g_seenData[k]; bus = g_seenBus[k]; } }
+        const char *via = strstr(line, " via ");
+        static char cacheP[40], *cacheData, *cacheBus;
+        if (!data && via && cacheData && !strcmp(cacheP, gp) && !IsBadReadPtr(cacheData, 8)) { data = cacheData; bus = cacheBus; }
+        if (!data && via) {   // eventfire <prefix> <ev> via <seen prefix>: a data instance that never fired - found by a memory scan for its
+            // GUID prefix (exactly one match with the GUID flag), fired on the bus of a seen one of the same sub-world (2026-10-30:
+            // Exfiltration's AB00 sub-world 09654c59 never sent "drivers board" 52ce4565 - its defector could not walk)
+            char vp[40] = "";
+            sscanf(via + 5, "%39s", vp);
+            for (int k = 0; k < g_seenN && !bus; k++) { data_guid_hex(g_seenData[k], g); if (g[0] && !strncmp(g, vp, strlen(vp))) bus = g_seenBus[k]; }
+            int ownBus = !strcmp(vp, "own");   // "via own": the bus of the data's own entity (found below), e.g. a prefab's
+            if (!bus && !ownBus) { bot_log("eventfire: via %s - not seen firing", vp); return; }
+            unsigned char want[16]; int wn = (int)strlen(gp) / 2, hits = 0; char *hit = NULL;
+            for (int b = 0; b < wn && b < 16; b++) { unsigned v; sscanf(gp + 2 * b, "%2x", &v); want[b] = (unsigned char)v; }
+            MEMORY_BASIC_INFORMATION mi; char *a = (char *)0x10000;
+            while ((unsigned)a < 0xFFFE0000u && VirtualQuery(a, &mi, sizeof mi)) {
+                char *base = mi.BaseAddress, *end = base + mi.RegionSize;
+                if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mi.Protect & PAGE_GUARD))
+                    for (char *p = base; p + 0x20 <= end; p += 4)
+                        if (!memcmp(p, want, wn) && (*(unsigned short *)(p + 0x16) & 0x100)) {
+                            unsigned vt = *(unsigned *)(p + 0x10);
+                            if (vt >= 0x02028000 && vt < 0x02a00000) { hits++; hit = p + 0x10; }
+                        }
+                if ((unsigned)end <= (unsigned)a) break;
+                a = end;
+            }
+            if (hits != 1) { bot_log("eventfire: %s - %d memory match(es), need exactly 1 (use a longer prefix)", gp, hits); return; }
+            data = hit;
+            if (ownBus) {   // its entity: an object holding the data pointer at +0x0c / +0x10 / +0x14 whose vtable's getData (slot 0x20)
+                // returns it - then its bus = vtable slot 0x1c (2026-10-30: the intro's fade Delay lives in the game mode prefab's bus)
+                typedef char *(__attribute__((thiscall)) *Get_t)(void *);
+                a = (char *)0x10000;
+                while (!bus && (unsigned)a < 0xFFFE0000u && VirtualQuery(a, &mi, sizeof mi)) {
+                    char *base = mi.BaseAddress, *end = base + mi.RegionSize;
+                    if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mi.Protect & PAGE_GUARD))
+                        for (char *p = base + 0x14; p + 4 <= end && !bus; p += 4) {
+                            if (*(char **)p != data) continue;
+                            for (int off = 0x0c; off <= 0x14 && !bus; off += 4) {
+                                char *e = p - off; unsigned vt = *(unsigned *)e;
+                                if (vt < 0x02028000 || vt >= 0x02a00000) continue;
+                                unsigned gd = ((unsigned *)vt)[0x20 / 4], gb = ((unsigned *)vt)[0x1c / 4];
+                                if (gd < 0x401000 || gd >= 0x02028000 || gb < 0x401000 || gb >= 0x02028000) continue;
+                                const unsigned char *gc = (const unsigned char *)gd;   // (only a trivial getter "mov eax,[ecx+imm8]; ret" is called)
+                                if (gc[0] != 0x8B || gc[1] != 0x41 || gc[3] != 0xC3 || gc[2] != off) continue;
+                                if (((Get_t)gd)(e) == data) { bus = ((Get_t)gb)(e); bot_log("eventfire: %s's entity %p (vt %08x), bus %p", gp, e, vt, bus); }
+                            }
+                        }
+                    if ((unsigned)end <= (unsigned)a) break;
+                    a = end;
+                }
+                if (!bus) { bot_log("eventfire: %s - its entity / bus not found", gp); return; }
+            }
+            bot_log("eventfire: %s found at %p (memory scan), fired on %s's bus %p", gp, data, vp, bus);
+        }
+        if (!data) { bot_log("eventfire: %s has not fired since the hook went in (%d instances known) - add: via <seen prefix>", gp, g_seenN); return; }
+        struct { unsigned vt, id; void *sender; } evt = {0x0246d404, id, NULL};
+        typedef char (__attribute__((thiscall)) *Fire_t)(void *bus, void *data, void *ev);
+        char r = ((Fire_t)ADDR_FIRE_EVENT)(bus, data, &evt);
+        bot_log("eventfire: %s event %08x fired on bus %p - %s", gp, id, bus, r ? "a connection took it" : "no connection matched");
+        if (r && via) { snprintf(cacheP, sizeof cacheP, "%s", gp); cacheData = data; cacheBus = bus; }
+    } else if (!strncmp(line, "eventchain", 10)) {   // eventchain <src prefix> <src ev> <ms> <dst prefix> <dst ev> | clear | list
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "clear")) { g_chainN = 0; bot_log("eventchain: cleared"); }
+        else if (!*a || !strcmp(a, "list")) { for (int k = 0; k < g_chainN; k++) bot_log("eventchain: %s %08x +%u ms -> %s %08x (%s)", g_chain[k].src, g_chain[k].srcEv, g_chain[k].ms, g_chain[k].dst, g_chain[k].dstEv, g_chain[k].dstData ? "target found" : "target not looked up yet"); }
+        else if (g_chainN < 8) {
+            EvChain *c = &g_chain[g_chainN];
+            memset(c, 0, sizeof *c);
+            if (sscanf(a, "%39s %x %u %39s %x", c->src, &c->srcEv, &c->ms, c->dst, &c->dstEv) != 5) { bot_log("usage: eventchain <src prefix> <src ev hex> <ms> <dst prefix> <dst ev hex>"); return; }
+            g_chainN++; fire_event_hook(1);
+            bot_log("eventchain: when %s fires %08x, %u ms later %s fires %08x", c->src, c->srcEv, c->ms, c->dst, c->dstEv);
+        }
+    } else if (!strncmp(line, "eventdrop", 9)) {   // eventdrop <guid hex prefix> | clear | list
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strcmp(a, "clear")) { g_eventDropN = 0; if (!g_eventTrace) fire_event_hook(0); bot_log("eventdrop: cleared"); }
+        else if (!*a || !strcmp(a, "list")) { for (int k = 0; k < g_eventDropN; k++) bot_log("eventdrop: %s", g_eventDrop[k]); bot_log("eventdrop: %d rule(s), %ld dropped", g_eventDropN, g_eventDropped); }
+        else if (g_eventDropN < 16) { snprintf(g_eventDrop[g_eventDropN++], 40, "%s", a); fire_event_hook(1); bot_log("eventdrop: outputs of %s* are dropped", a); }
+    } else if (!strncmp(line, "coopfade", 8)) {   // coopfade <console command> | off (see g_coopFadeCmd)
+        const char *a = line + 8 + (line[8] == ' ');
+        snprintf(g_coopFadeCmd, sizeof g_coopFadeCmd, "%s", strcmp(a, "off") ? a : "");
+        bot_log("coopfade: %s", g_coopFadeCmd[0] ? g_coopFadeCmd : "OFF");
+    } else if (!strncmp(line, "antray", 6)) {   // antray dummy|skip (see ant_node_guard)
+        const char *a = line + 6 + (line[6] == ' ');
+        unsigned char *fakeObj = g_antNodeStub ? g_antNodeStub + 0xc0 : NULL;
+        if (!strcmp(a, "dummy") && fakeObj) { *(DWORD *)fakeObj = (DWORD)(g_antNodeStub + 0xa0); g_antRayDummy = 1; }
+        else if (!strcmp(a, "real") && fakeObj) { *(DWORD *)fakeObj = (DWORD)g_frpVt; g_frpLogged = 0; g_antRayDummy = 1; }
+        else if (!strcmp(a, "skip")) g_antRayDummy = 0;
+        else if (!strncmp(a, "flags ", 6)) g_frpRayFlags = strtoul(a + 6, NULL, 0);
+        bot_log("antray: %s - %ld node evaluation(s) skipped, %ld provider install(s) | real provider: %ld rays (%ld vertical, not cast), %ld hits, ray flags 0x%x",
+                !g_antRayDummy ? "SKIP" : fakeObj && *(DWORD *)fakeObj == (DWORD)g_frpVt ? "REAL" : "DUMMY", g_antNodeSkipped, g_antNodeDummied, g_frpQueries, g_frpVertical, g_frpHits, g_frpRayFlags);
+    } else if (!strncmp(line, "aihost", 6)) {   // aihost on|off (see ai_host_tick)
+        const char *a = line + 6 + (line[6] == ' ');
+        if (!strcmp(a, "on")) { g_aiHostOn = 1; g_aiHostLogged = 0; } else if (!strcmp(a, "off")) g_aiHostOn = 0;
+        int run = 0; for (int k = 0; k < 64; k++) if (g_aiHost[k].loco && g_aiHost[k].running) run++;
+        bot_log("aihost: %s - %ld orders started, %ld arrived, %ld given up (stuck / not adopted), %d running now", g_aiHostOn ? "ON" : "OFF",
+                g_aiHostStarted, g_aiHostDone, g_aiHostTimeout, run);
+    } else if (!strncmp(line, "antworld", 8)) {   // antworld on|off (see ant_setbone_hook)
+        const char *a = line + 8 + (line[8] == ' ');
+        if (!strcmp(a, "on")) ant_world(1); else if (!strcmp(a, "off")) ant_world(0);
+        bot_log("antworld: %s, %d AI animatable(s), %ld world references set (setBone path), %ld (no entity space, from the entity transform)", g_antWorld ? "ON" : "OFF", g_aiAntN, g_antWorldSet, g_antWorldSet0);
+    } else if (!strcmp(line, "airootvel")) {   // airootvel: each engine AI's Ant root-velocity DOF (0x005a99e0, scratchpad\rootmotion) - 2026-11-02
+        char *bm = *(char **)0x02bdac28;
+        char **b0 = bm && !IsBadReadPtr(bm + 0x21c, 8) ? *(char ***)(bm + 0x21c) : NULL, **b1 = b0 ? *(char ***)(bm + 0x220) : NULL;
+        int nb = b0 && b1 > b0 ? (int)(b1 - b0) : 0;
+        bot_log("airootvel: %d active bot(s)", nb);
+        for (int k = 0; k < nb && k < 64; k++) {
+            char *bot = b0[k], *pf, *mc, *loco, *comp, *ant, *desc, *gsb;
+            if (!bot || IsBadReadPtr(bot, 0x6d0)) continue;
+            pf = *(char **)(bot + 0x3b0);
+            if (!pf || IsBadReadPtr(pf, 0x40)) continue;
+            mc = *(char **)(pf + 8);
+            if (!mc || IsBadReadPtr(mc, 4) || *(unsigned *)mc != 0x025c5d48) continue;
+            loco = mc - 0x20;
+            if (IsBadReadPtr(loco, 0x5a0)) continue;
+            comp = *(char **)(loco + 0x4a0);
+            if (!comp || IsBadReadPtr(comp, 0x240)) { bot_log("airootvel: bot %p no animatable comp", bot); continue; }
+            ant = *(char **)(comp + 0x10 + 0xc4);
+            int mode = *(int *)(comp + 0x10 + 0x164);
+            if (!ant || IsBadReadPtr(ant, 0x190)) { bot_log("airootvel: bot %p mode %d no ant", bot, mode); continue; }
+            desc = *(char **)(ant + 0x10); gsb = *(char **)(ant + 0x14);
+            if (!*(int *)(ant + 0x3c) || !desc || !gsb || IsBadReadPtr(desc, 0x70) || IsBadReadPtr(gsb, 0x20)) { bot_log("airootvel: bot %p mode %d ant %p pose invalid", bot, mode, ant); continue; }
+            char *gs = gsb + *(unsigned short *)(gsb + 0x1c);
+            int off = *(int *)(desc + 0x64);
+            float *v = (float *)(gs + off + 0x40);
+            if (IsBadReadPtr(v, 12)) { bot_log("airootvel: bot %p bad DOF ptr", bot); continue; }
+            float *lp = (float *)(loco + 0x210);
+            char *ga = comp + 0x10;
+            bot_log("airootvel: bot %p mode %d ant %p rootvel*60 (%.2f %.2f %.2f) m/s | loco sees (%.1f %.1f %.1f) | task %p | space type %d bone %d on %d | ant 111:%d 114:%d 115:%d 116:%d",
+                    bot, mode, ant, v[0] * 60.0f, v[1] * 60.0f, v[2] * 60.0f, lp[0], lp[1], lp[2], *(char **)(loco + 0x4ac),
+                    *(int *)(ga + 0x70), *(int *)(ga + 0x90), ga[0x98], (unsigned char)ant[0x111], ant[0x114], ant[0x115], ant[0x116]);
+        }
+    } else if (!strcmp(line, "aimovediag")) {   // aimovediag: each engine AI bot's move goal (2026-11-02 research, scratchpad\aimove)
+        char *bm = *(char **)0x02bdac28;
+        char **b0 = bm && !IsBadReadPtr(bm + 0x21c, 8) ? *(char ***)(bm + 0x21c) : NULL, **b1 = b0 ? *(char ***)(bm + 0x220) : NULL;
+        int nb = b0 && b1 > b0 ? (int)(b1 - b0) : 0;
+        bot_log("aimovediag: BotManager %p, %d active bot(s)", bm, nb);
+        for (int k = 0; k < nb && k < 64; k++) {
+            char *bot = b0[k];
+            if (!bot || IsBadReadPtr(bot, 0x6d0)) continue;
+            char *pref = *(char **)(bot + 0x320), *pl = pref && !IsBadReadPtr(pref, 4) && *(char **)pref ? *(char **)pref - 8 : NULL;
+            char *so = *(char **)(bot + 0x3b4), *pf = *(char **)(bot + 0x3b0);
+            float *sp = so && !IsBadReadPtr(so + 0x4c0, 4) ? (float *)(so + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+            char *loco = NULL, *task = NULL, *mr = NULL;
+            if (pf && !IsBadReadPtr(pf, 0x40)) {
+                char *mc = *(char **)(pf + 8);
+                if (mc && !IsBadReadPtr(mc, 4) && *(unsigned *)mc == 0x025c5d48) loco = mc - 0x20;
+                mr = *(char **)(pf + 0x28);
+            }
+            unsigned tvt = 0; float *tp = NULL;
+            if (loco && !IsBadReadPtr(loco, 0x5a0)) { task = *(char **)(loco + 0x4ac); if (task && !IsBadReadPtr(task, 0x70)) { tvt = *(unsigned *)task; tp = (float *)(task + 0x30); } }
+            float *lp = loco ? (float *)(loco + 0x210) : NULL;
+            bot_log("aimovediag: bot %p player %p team %d soldier %p at (%.1f %.1f %.1f) | pf %p active %d | loco %p mode568 %d curId %u ackId %u ackState %d | task %p vt %08x -> (%.1f %.1f %.1f) r %.1f | loco sees (%.1f %.1f %.1f) | mr state %d idx %d",
+                    bot, pl, pl ? player_team(pl) : -1, so, sp ? sp[0] : 0, sp ? sp[1] : 0, sp ? sp[2] : 0, pf, pf ? *(int *)(pf + 0x14) : -1,
+                    loco, loco ? loco[0x568] : -1, loco ? *(unsigned *)(loco + 0x4b0) : 0, loco ? *(unsigned *)(loco + 0x30) : 0, loco ? *(int *)(loco + 0x44) : -1,
+                    task, tvt, tp ? tp[0] : 0, tp ? tp[1] : 0, tp ? tp[2] : 0, task ? *(float *)(task + 0x1c) : 0, lp ? lp[0] : 0, lp ? lp[1] : 0, lp ? lp[2] : 0,
+                    mr && !IsBadReadPtr(mr, 0x1a8) ? *(int *)(mr + 0x1a0) : -1, mr && !IsBadReadPtr(mr, 0x1a8) ? *(int *)(mr + 0x1a4) : -1);
+        }
+    } else if (!strncmp(line, "coopgunners", 11)) {   // coopgunners [show]: mission AI on foot next to a friendly vehicle with a free gunner seat get in
+        // (2026-11-03, Exfiltration: the 3 humvee .50 gunners stood next to their humvees instead of in the turrets)
+        int show = strstr(line, "show") != NULL, seated = 0;
+        float range = line[11] == ' ' && atof(line + 12) > 0 ? (float)atof(line + 12) : 25.0f;   // coopgunners <range m>
+        char *pm = player_manager();
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+        char *vehs[16]; int nv = 0, vteam[16];
+        for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+            char *p = arr[k], *v = p ? player_vehicle(p) : NULL;
+            if (!v) continue;
+            int dup = 0; for (int q = 0; q < nv; q++) if (vehs[q] == v) dup = 1;
+            if (!dup && nv < 16) { vteam[nv] = player_team(p); vehs[nv++] = v; }
+        }
+        for (int q = 0; q < nv; q++) {
+            char **b; int n = vehicle_seats(vehs[q], &b);
+            float *vp0 = vehicle_pos(vehs[q], NULL); char line2[240]; int o = snprintf(line2, sizeof line2, "coopgunners: %s %p team %d at (%.1f %.1f %.1f) seats:", vehicle_name(vehs[q]), vehs[q], vteam[q], vp0 ? vp0[0] : 0, vp0 ? vp0[1] : 0, vp0 ? vp0[2] : 0);
+            for (int z = 0; z < n && o < 230; z++) o += snprintf(line2 + o, sizeof line2 - o, " %d=%s", z, *(void **)(b[z] + 0x4c) ? "x" : "-");
+            if (show) bot_log("%s", line2);
+        }
+        for (unsigned k = 0; !show && arr && k < cnt && k < 128; k++) {
+            char *p = arr[k];
+            if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p) || player_vehicle(p)) continue;
+            char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+            if (!so || IsBadReadPtr(so + 0x4c0, 4)) continue;
+            float *sp = (float *)(so + OFF_SOLDIER_SPAWN_POSITION);
+            char *best = NULL; float bd = range;
+            for (int q = 0; q < nv; q++) {
+                if (vteam[q] != player_team(p)) continue;
+                char **b; int n = vehicle_seats(vehs[q], &b);
+                if (n < 2 || *(void **)(b[1] + 0x4c)) continue;   // (seat 1 = the gunner's)
+                float *vp = vehicle_pos(vehs[q], NULL);
+                if (!vp) continue;
+                float dx = vp[0] - sp[0], dz = vp[2] - sp[2], d = sqrtf(dx * dx + dz * dz);
+                if (d < bd) { bd = d; best = vehs[q]; }
+            }
+            if (!best) continue;
+            char ok = ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(p, best, 1);
+            bot_log("coopgunners: AI %p (team %d) %.1f m from the %s %p -> gunner seat: %s", p, player_team(p), bd, vehicle_name(best), best, ok ? "in" : "refused");
+            if (ok) seated++;
+        }
+        if (!show) bot_log("coopgunners: %d seated", seated);
+    } else if (!strcmp(line, "aiveh")) {   // aiveh: every mission AI player - team, soldier position, physics flag, vehicle (2026-11-03)
+        char *pm = player_manager();
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+        for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+            char *p = arr[k];
+            if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p)) continue;
+            char *so = *(char **)(p + OFF_PLAYER_SOLDIER), *veh = player_vehicle(p);
+            float *sp = so && !IsBadReadPtr(so + 0x4c0, 4) ? (float *)(so + OFF_SOLDIER_SPAWN_POSITION) : NULL;
+            bot_log("aiveh: %p team %d soldier %p phys %d at (%.1f %.1f %.1f) vehicle %p %s", p, player_team(p), so, so && !IsBadReadPtr(so + 0x24c, 4) ? so[0x249] : -1,
+                    sp ? sp[0] : 0, sp ? sp[1] : 0, sp ? sp[2] : 0, veh, veh ? vehicle_name(veh) : "");
+        }
+    } else if (!strcmp(line, "aiinput")) {   // aiinput: each AI player's EntryInput levels (throttle 0, strafe 1, yaw 4, pitch 5) + position
+        char *pm = player_manager();
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+        for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+            char *p = arr[k];
+            if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p)) continue;
+            char *so = *(char **)(p + OFF_PLAYER_SOLDIER), *in = *(char **)(p + OFF_PLAYER_INPUT);
+            if (!so || !in) continue;
+            float *lv = (float *)(in + 0x10), *sp = (float *)(so + OFF_SOLDIER_SPAWN_POSITION), *cp = *(char **)(so + 0x1d4) ? (float *)(*(char **)(so + 0x1d4) + 0x120) : NULL;
+            bot_log("aiinput: %p team %d at (%.1f, %.1f, %.1f) throttle %.2f strafe %.2f yaw %.2f pitch %.2f dt %.4f | charPhys+0x120 %.2f %.2f %.2f",
+                    p, player_team(p), sp[0], sp[1], sp[2], lv[0], lv[1], lv[4], lv[5], *(float *)(in + 0x1ec), cp ? cp[0] : 0, cp ? cp[1] : 0, cp ? cp[2] : 0);
+        }
+    } else if (!strncmp(line, "aimove", 6) && line[6] != 'd') {   // aimove on|off (see ai_move_input)
+        const char *a = line + 6 + (line[6] == ' ');
+        if (!strcmp(a, "on")) ai_move(1); else if (!strcmp(a, "off")) ai_move(0);
+        else bot_log("aimove: %s, %ld steering inputs, %ld routes planned, %ld failed (no grid path)", g_aiMove ? "ON" : "OFF", g_aiMoveSteered, g_aiRoutePlans, g_aiRouteFails);
+    } else if (!strncmp(line, "aiblueprint", 11)) {   // aiblueprint coop|off (see ai_blueprint)
+        const char *a = line + 11 + (line[11] == ' ');
+        if (!strcmp(a, "coop")) { g_aiBpWanted = 1; g_bpLevel[0] = 0; } else if (!strcmp(a, "off")) { g_aiBpWanted = 0; ai_blueprint(0); }
+        bot_log("aiblueprint: %s, %d spawner(s) swapped", g_aiBpWanted ? "COOP (applied on each co-op level once its spawners exist)" : "OFF", g_bpN);
+    } else if (!strncmp(line, "aiphys", 6)) {   // aiphys on|off|convert (see ai_phys)
+        const char *a = line + 6 + (line[6] == ' ');
+        if (!strcmp(a, "on")) ai_phys(1); else if (!strcmp(a, "off")) ai_phys(0); else if (!strcmp(a, "convert")) ai_phys_convert();
+        else bot_log("aiphys: %s", g_aiPhys ? "ON" : "OFF");
+    } else if (!strncmp(line, "aistep", 6)) {   // aistep on|off (see ai_step_tick)
+        const char *a = line + 6 + (line[6] == ' ');
+        if (!strcmp(a, "on")) g_aiStep = 1; else if (!strcmp(a, "off")) g_aiStep = 0; else if (!strcmp(a, "single")) g_aiStep = 2;
+        bot_log("aistep: %s, %ld steps so far, %ld AI soldiers seen stepped by the engine", g_aiStep ? "ON" : "OFF", g_aiStepped, g_aiStepSkip0);
+    } else if (!strncmp(line, "aieye", 5)) {   // aieye on|off (see ai_eye)
+        const char *a = line + 5 + (line[5] == ' ');
+        if (!strcmp(a, "on")) ai_eye(1); else if (!strcmp(a, "off")) ai_eye(0); else bot_log("aieye: %s", g_aiEye ? "ON" : "OFF");
+    } else if (!strncmp(line, "aiaim", 5)) {   // aiaim on|off (see ai_aim)
+        const char *a = line + 5 + (line[5] == ' ');
+        if (!strcmp(a, "on")) ai_aim(1); else if (!strcmp(a, "off")) ai_aim(0);
+        else if (!strncmp(a, "recompute ", 10)) { g_aimRecompute = !strcmp(a + 10, "on"); bot_log("aiaim: recompute %s", g_aimRecompute ? "ON" : "OFF"); }
+        else bot_log("aiaim: %s, %ld forced aims, %ld held back by a wall, %ld not facing the target yet, recompute %s", g_aiAim ? "ON" : "OFF", g_aimForced, g_aimWalled, g_aimTurning, g_aimRecompute ? "ON" : "OFF");
+    } else if (!strncmp(line, "aifirediag", 10)) {   // aifirediag on|off|show (see fire_diag)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "on")) fire_diag(1); else if (!strcmp(a, "off")) fire_diag(0); else fire_diag_show();
+    } else if (!strncmp(line, "aifire", 6)) {   // aifire on|off (see ai_fire)
+        const char *a = line + 6 + (line[6] == ' ');
+        if (!strcmp(a, "on")) ai_fire(1); else if (!strcmp(a, "off")) ai_fire(0); else bot_log("aifire: %s", g_aiFire ? "ON" : "OFF");
+    } else if (!strncmp(line, "serveranim except", 17)) {   // serveranim except LEVEL[,LEVEL...] (see level_swap)
+        snprintf(g_serverAnimExcept, sizeof g_serverAnimExcept, "%s", line + 17 + (line[17] == ' '));
+        bot_log("serveranim: no animation manager on: %s", g_serverAnimExcept[0] ? g_serverAnimExcept : "(none)");
+    } else if (!strncmp(line, "serveranim", 10)) {   // serveranim on|off (see server_anim)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "on")) server_anim(1); else if (!strcmp(a, "off")) server_anim(0);
+        else bot_log("serveranim: %s", g_serverAnim ? "ON" : "OFF");
+    } else if (!strncmp(line, "inputguard", 10)) {   // inputguard on|off (see input_guard)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "on")) input_guard(1); else if (!strcmp(a, "off")) input_guard(0);
+        else bot_log("inputguard: %s", g_inputGuard ? "ON" : "OFF");
+    } else if (!strncmp(line, "pointguard", 10)) {   // pointguard on|off (see point_guard)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "on")) point_guard(1); else if (!strcmp(a, "off")) point_guard(0);
+        else bot_log("pointguard: %s", g_pointGuard ? "ON" : "OFF");
+    } else if (!strncmp(line, "animguard", 9)) {   // animguard on|off
+        const char *a = line + 9 + (line[9] == ' ');
+        if (!strcmp(a, "on")) anim_guard(1);
+        else if (!strcmp(a, "off")) anim_guard(0);
+        else bot_log("animguard: %s, %ld skipped so far, %ld Ant node evaluation(s) skipped, avoidance pool %d used", g_animGuard ? "ON" : "OFF", g_animSkipped, g_antNodeSkipped, avoid_pool_used());
+    } else if (!strncmp(line, "levelswap", 9)) {   // levelswap <FROM> <TO> | off
+        cmd_levelswap(line + 9 + (line[9] == ' '));
+    } else if (!strncmp(line, "ceiling", 7)) {   // ceiling [m]: the level's aircraft ceiling (MaxVehicleHeight)
+        cmd_ceiling(line + 7);
+    } else if (!strncmp(line, "deathareas", 10)) {   // deathareas off|on (experiment)
+        const char *a = line + 10 + (line[10] == ' ');
+        if (!strcmp(a, "off")) *death_areas_off() = 1;
+        else if (!strcmp(a, "on")) *death_areas_off() = 0;
+        else { bot_log("deathareas: %s (usage: deathareas off|on)", *death_areas_off() == 1 ? "OFF" : "ON"); return; }
+        death_areas_tick();
+    } else if (!strncmp(line, "physshift", 9)) {
+        phys_shift(line + 9 + (line[9] == ' '));
+    } else if (!strncmp(line, "terrainfull", 11)) {   // terrainfull on|off: load every terrain node at level load (experiment)
+        const char *a = line + 11 + (line[11] == ' ');
+        if (!strncmp(a, "hold ", 5)) {   // terrainfull hold on|off|none: fixed for this server (borders.txt no longer changes it)
+            g_terrainHold = !strcmp(a + 5, "on") ? 1 : !strcmp(a + 5, "off") ? 0 : -1;
+            if (g_terrainHold >= 0) *terrain_full() = g_terrainHold;
+            bot_log("terrainfull: hold %s", g_terrainHold < 0 ? "none (borders.txt decides)" : g_terrainHold ? "ON" : "OFF");
+        }
+        else if (!strcmp(a, "on")) *terrain_full() = 1;
+        else if (!strcmp(a, "off")) *terrain_full() = 0;
+        else { bot_log("terrainfull: %s (usage: terrainfull on|off)", *terrain_full() == 1 ? "ON" : "OFF"); return; }
+        terrain_full_tick();
+    } else if (!strcmp(line, "terraininfo")) {
+        terrain_info();
+    } else if (!strncmp(line, "terrainscan", 11)) {
+        terrainscan_start(line + 11 + (line[11] == ' '));
     } else if (!strncmp(line, "heightmap ", 10)) {   // heightmap <x> <z> <half size m> <step m>: ground heights around a point
         float cx, cz, hs = 3, st = 0.5f, fromY = 400.0f;
         if (sscanf(line + 10, "%f %f %f %f %f", &cx, &cz, &hs, &st, &fromY) < 2) { bot_log("usage: heightmap x z [half] [step] [ray start y]"); return; }
@@ -12276,12 +15488,13 @@ __declspec(dllexport) void botmod_command(char *line)
         unsigned a[4] = {0}; int n = sscanf(line + 10, "%x %x %x %x", &a[0], &a[1], &a[2], &a[3]);
         if (n < 1 || !g_mainTid) { bot_log("usage: watchaddr <hex> [<hex> <hex> <hex>] [read]"); return; }
         g_hwRead = strstr(line, " read") != NULL;
-        for (int s = 0; s < 4; s++) g_hwAddr[s] = s < n ? (a[s] & ~3u) : 0;
+        g_hwExec = strstr(line, " exec") != NULL;
+        for (int s = 0; s < 4; s++) g_hwAddr[s] = s < n ? (g_hwExec ? a[s] : (a[s] & ~3u)) : 0;
         g_hwCount = n;
         hw_watch(1);
-        bot_log("watch: %d address(es) from %08x, %s", n, a[0], g_hwRead ? "reads and writes" : "writes");
+        bot_log("watch: %d address(es) from %08x, %s", n, a[0], g_hwExec ? "code (exec)" : g_hwRead ? "reads and writes" : "writes");
     } else if (!strncmp(line, "watchunlocks ", 13)) {   // watchunlocks <player> | off: trap every write to its selected-unlocks vector
-        if (!strcmp(line + 13, "off")) { hw_watch(0); bot_log("watch: off (%ld hit(s))", g_hwHits); return; }
+        if (!strcmp(line + 13, "off")) { hw_watch(0); g_hwExec = 0; bot_log("watch: off (%ld hit(s))", g_hwHits); return; }
         char who[64]; snprintf(who, sizeof who, "%s", line + 13);
         g_hwRead = 0;
         { char *sp = strrchr(who, ' '); if (sp && !strcmp(sp + 1, "read")) { *sp = 0; g_hwRead = 1; } }
@@ -12368,7 +15581,8 @@ __declspec(dllexport) void botmod_command(char *line)
         while (e > line + 3 && words < 3) { e--; if (*e == ' ' && e[1] != ' ') words++; }
         snprintf(name, sizeof name, "%.*s", (int)(e - (line + 3)), line + 3);
         sscanf(e, "%f %f %f", &v[0], &v[1], &v[2]);
-        char *pl = find_player(name);
+        char *pl = !strncmp(name, "0x", 2) ? (char *)strtoul(name, NULL, 16) : find_player(name);   // (0x<player>: nameless mission AI)
+        if (pl && IsBadReadPtr(pl, 0x400)) pl = NULL;
         char *s = pl ? *(char **)(pl + OFF_PLAYER_SOLDIER) : NULL;
         if (!s) { bot_log("tp: '%s' has no soldier", name); return; }
         memcpy(s + OFF_SOLDIER_POSITION, v, 12);
@@ -15016,6 +18230,30 @@ static int squad_ride_pending(int i)
         if (vp && dist2(vp, me) < 200.0f * 200.0f) return 1;
     }
     return 0;
+}
+// CTF (the user, 2026-10-27): a vehicle with our flag carrier aboard - driver or passenger - goes home, whoever drives it (a bot that
+// took a vehicle itself kept the trip it chose: to their flag, "Get out!" there - the carrier jumped out with the flag and walked)
+static void pilot_drive_to(int i, DriveState *d, char *veh, const float *goal, int flag);
+static void ctf_carrier_vehicle_tick(void)
+{
+    if (!is_ctf_mode() || H->frame % 30 != 11) return;
+    for (int team = 1; team <= 2; team++) {
+        char *cr = ctf_carrier(3 - team), *v = cr && player_team(cr) == team ? player_vehicle(cr) : NULL;
+        if (!v || vehicle_kind(v) == VK_HELI || vehicle_kind(v) == VK_JET) continue;   // (helicopters: their ride code - ride_destination)
+        float *vp = vehicle_pos(v, NULL), dst[3];
+        int df;
+        if (!vp || !ride_destination(-1, v, team, vp, 0, dst, &df)) continue;
+        for (int j = 0; j < H->botCount; j++) {
+            DriveState *d = &g_drive[j];
+            if (player_vehicle(H->bots[j]) != v || d->veh != v || d->phase < 2 || d->phase == 5) continue;   // (its driver)
+            if (dist2(d->goal, dst) < 20.0f * 20.0f) break;
+            bot_log("ctf: %s's %s has the flag aboard (%s) - home now (%.0f m)", H->bots[j] + OFF_PLAYER_ONLINE_NAME, vehicle_name(v),
+                    cr + OFF_PLAYER_ONLINE_NAME, sqrtf(dist2(vp, dst)));
+            if (is_pilot(j)) pilot_drive_to(j, d, v, dst, df);
+            else { memcpy(d->goal, dst, 12); d->flag = df; d->phase = 2; d->n = 0; d->at = H->frame; g_driveToPos[j] = df < 0; }
+            break;
+        }
+    }
 }
 // A bot on its own (the user, 2026-10-19: a Growler stood unused at the HQ while bots stood there till their timers ran out):
 // on foot, its flag over DRIVE_MIN_TRIP away, a free allowed ground vehicle of ours within reach (the small open ones 50 m,
@@ -20222,6 +23460,981 @@ static void inwatch_tick(void)
     if (k) bot_log("inwatch:%s", out);
 }
 
+// ---- coopspawn (2026-10-28, co-op maps on the MP server): a co-op mission spawns exactly 2 humans - one CoopSoldier spawner each
+// (CharacterSpawnEntity vt 025bbbc0 whose data+0x50 = Characters/Soldiers/CoopSoldier, data+0x180 = 0). Nothing switches them off:
+// spawner+0x8c counts the soldiers it made and the enabled check (0x00e44ea0) says "disabled" once that equals its max (1). A 3rd
+// human (or a dead one) gets the free camera. coopspawn: counter -> 0, spawn the player through the spawner (vslot 0x6c, the same
+// call as spawnvia), counter restored if nothing came of it. "coopspawn auto on": every human without a soldier on a COOP_ level,
+// once the mission has used its spawners, is put on team 1 and spawned 1 s later ("coopspawn delay <s>"; respawns too).
+static char g_coopLevel[128];
+static int coop_find_spawners(void)
+{
+    char *sp[128];
+    int n = scan_objects(0x025bbbc0, sp, 128);
+    g_coopSpN = 0;
+    for (int s = 0; s < n && g_coopSpN < 8; s++) {
+        char *data = !IsBadReadPtr(sp[s] + 0x14, 4) ? *(char **)(sp[s] + 0x14) : NULL;
+        if (!data || IsBadReadPtr(data, 0x190) || *(int *)(data + 0x180) != 0) continue;
+        if (!strstr(asset_name(*(void **)(data + 0x50)), "CoopSoldier")) continue;
+        g_coopSp[g_coopSpN++] = sp[s];
+    }
+    return g_coopSpN;
+}
+static int coop_spawner_ok(char *sp) { return sp && !IsBadReadPtr(sp, 0x90) && *(unsigned *)sp == 0x025bbbc0; }
+// coopfade <console command> (2026-10-30): run 1.5 s after BotMod spawns a human on a co-op level - a player who joins after the
+// mission's intro gets no fade-in (a black world, HUD and name tags only): startup "coopfade eventfire cef21f35 0b87df4b via own"
+// re-fires the shared CoOp_IntroLogic prefab's fade Delay (its Out -> FadeIn, networked to every client; a no-op for faded-in ones).
+static int coop_spawn_one(char *pl, int quiet)
+{
+    if (!pl || *(void **)(pl + OFF_PLAYER_SOLDIER)) return 0;
+    if (!g_coopSpN && !coop_find_spawners()) { if (!quiet) bot_log("coopspawn: no CoopSoldier spawners on this level"); return 0; }
+    if (player_team(pl) != 1) ((AddToTeam_t)ADDR_ADD_TO_TEAM)(pl, 1, 0, 1);
+    for (int k = 0; k < g_coopSpN; k++) {
+        char *sp = g_coopSp[(g_coopNext + k) % g_coopSpN];
+        if (!coop_spawner_ok(sp)) { g_coopSpN = 0; return 0; }   // (level changed - found again next time)
+        unsigned fn = *(unsigned *)(*(unsigned *)sp + 0x6c);
+        int old = *(int *)(sp + OFF_SPAWNER_COUNT);
+        *(int *)(sp + OFF_SPAWNER_COUNT) = 0;
+        ((CseSpawn_t)fn)((void *)sp, pl, 0xffffffffu, 0, 0);
+        void *s = *(void **)(pl + OFF_PLAYER_SOLDIER);
+        if (!s) { *(int *)(sp + OFF_SPAWNER_COUNT) = old; continue; }
+        g_coopNext = (g_coopNext + k + 1) % g_coopSpN;
+        if (!is_bot(pl) && g_coopFadeCmd[0]) g_coopFadeDue = GetTickCount() + 1500;
+        if (!is_bot(pl))   // (humans only - a coopsquad bot was handed an extra Viper at the pad, 2026-10-29)
+            for (int q = 0; q < 8; q++) if (!g_coopNewPl[q] || g_coopNewPl[q] == pl || GetTickCount() - g_coopNewAt[q] > 120000) { g_coopNewPl[q] = pl; g_coopNewAt[q] = GetTickCount(); break; }
+        bot_log("coopspawn: %s spawned through %p (%s) -> soldier %p", pl + OFF_PLAYER_ONLINE_NAME, sp,
+                asset_name(*(void **)(*(char **)(sp + 0x14) + 0x188)), s);
+        return 1;
+    }
+    if (!quiet) bot_log("coopspawn: %s - every co-op spawner refused", pl + OFF_PLAYER_ONLINE_NAME);
+    return 0;
+}
+// ---- The ground team (2026-10-29, the user: "if two player Cobras are in the air, all other players spawn as foot soldiers at or near
+// the grounded Huey"): a human beyond the extra helicopters is seated in a transport parked on the LZ mark for a second and let out -
+// on foot at the LZ. The transport: a FRESH Huey from the mission's Huey spawners put on the mark and watched for 5 s - one the
+// mission is flying (keyframed) moves off, and a human in a keyframed vehicle is a FatalAssert ("Trying to keyframe animation on
+// vehicle having human player") - only one that stays put is used; else (g_hueyBad, the rest of the level) the AH-1Z spare instead.
+static char *g_gExitPl[8]; static DWORD g_gExitAt[8];
+static char *coop_fresh_vehicle(const char *part)   // fired with no player, count reset; NULL if it only hands back an existing one
+{
+    char *sp[64], *vs[64];
+    int n = scan_objects(ADDR_VEHICLE_SPAWN_VTABLE, sp, 64), nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+    for (int pass = 0; pass < 2; pass++)
+        for (int k = 0; k < n; k++) {
+            char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+            char *bp = d && !IsBadReadPtr(d + 0x50, 4) ? *(char **)(d + 0x50) : NULL;
+            if (!bp || !strstr(asset_name(bp), part) || IsBadReadPtr(d + 0x171, 1)) continue;
+            if (pass == 0 && d[0x171]) continue;   // (first: one that does not spawn at mission start)
+            unsigned fn = *(unsigned *)(*(unsigned *)sp[k] + 0x6c);
+            *(int *)(sp[k] + OFF_SPAWNER_COUNT) = 0;
+            char *v = ((CseSpawn_t)fn)((void *)sp[k], NULL, 0xffffffffu, 0, 0);
+            if (!v || IsBadReadPtr(v, 0x200) || *(unsigned *)v != ADDR_VEHICLE_VTABLE) continue;
+            int old = 0;
+            for (int q = 0; q < nv; q++) if (vs[q] == v) old = 1;
+            if (!old) return v;
+        }
+    return NULL;
+}
+// A vehicle of <look> (a blueprint name part, e.g. Venom) out of a spawner of <spawnerPart> the mission never fires (InitialAutoSpawn 0):
+// its data's Blueprint (+0x50) swapped for <look>'s for the one spawn, then put back (2026-10-29, the user: "a gunship, not a Huey -
+// we need the immersion"). The mission's Huey spawners fly every Huey they make (their keyframed route); the AH-1Z spare's spawner
+// animates nothing - so a Huey from IT should stay parked.
+static char *coop_vehicle_as(const char *spawnerPart, const char *look)
+{
+    char *sp[64], *vs[64], *bpLook = NULL, *spare = NULL;
+    int n = scan_objects(ADDR_VEHICLE_SPAWN_VTABLE, sp, 64), nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+    for (int k = 0; k < n; k++) {
+        char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+        char *bp = d && !IsBadReadPtr(d + 0x50, 4) ? *(char **)(d + 0x50) : NULL;
+        if (!bp || IsBadReadPtr(d + 0x171, 1)) continue;
+        if (!bpLook && strstr(asset_name(bp), look)) bpLook = bp;
+        if (!spare && strstr(asset_name(bp), spawnerPart) && !d[0x171]) spare = sp[k];
+    }
+    if (!bpLook || !spare) return NULL;
+    char *d = *(char **)(spare + 0x14), *was = *(char **)(d + 0x50);
+    DWORD old;
+    VirtualProtect(d + 0x50, 4, PAGE_READWRITE, &old);
+    *(char **)(d + 0x50) = bpLook;
+    unsigned fn = *(unsigned *)(*(unsigned *)spare + 0x6c);
+    *(int *)(spare + OFF_SPAWNER_COUNT) = 0;
+    char *v = ((CseSpawn_t)fn)((void *)spare, NULL, 0xffffffffu, 0, 0);
+    *(char **)(d + 0x50) = was;
+    VirtualProtect(d + 0x50, 4, old, &old);
+    if (!v || IsBadReadPtr(v, 0x200) || *(unsigned *)v != ADDR_VEHICLE_VTABLE) return NULL;
+    for (int q = 0; q < nv; q++) if (vs[q] == v) return NULL;   // (an old one handed back)
+    bot_log("coopground: a %s built by the %s spare's spawner (its blueprint swapped for the one spawn)", vehicle_name(v), spawnerPart);
+    return v;
+}
+static char *coop_ground_vehicle(void)   // the parked LZ transport once it is confirmed still (NULL: not yet - call again)
+{
+    float mk[3], yaw;
+    const char *mark = g_squadMark[0] ? g_squadMark : "huey";
+    if (!coop_mark_get(mark, mk, &yaw)) { static DWORD said; if (GetTickCount() - said > 10000) { said = GetTickCount(); bot_log("coopground: no mark '%s' on %s", mark, g_level); } return NULL; }
+    DWORD now = GetTickCount();
+    if (g_gVeh && (IsBadReadPtr(g_gVeh, 0x200) || *(unsigned *)g_gVeh != ADDR_VEHICLE_VTABLE)) { g_gVeh = NULL; g_gState = 0; }
+    if (!g_gVeh) {   // never a second one on the mark: a vehicle already standing within 12 m of it is the transport (the user, 2026-10-29:
+        char *vs[64];  //  a BotMod reload forgot the parked Huey and parked another on top of it)
+        int nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+        for (int k = 0; k < nv && !g_gVeh; k++) {
+            float *x = vehicle_xf(vs[k]);
+            if (!x || *(float *)(vs[k] + OFF_VEHICLE_HEALTH) <= 0) continue;
+            float dx = x[12] - mk[0], dz = x[14] - mk[2];
+            if (dx * dx + dz * dz < 12.0f * 12.0f) {
+                g_gVeh = vs[k]; g_gState = 2;
+                bot_log("coopground: a %s already stands on the mark '%s' - that one is the transport", vehicle_name(vs[k]), mark);
+            }
+        }
+        if (g_gVeh) return g_gVeh;
+    }
+    if (!g_gVeh) {
+        g_gVeh = !g_hueyBad ? coop_vehicle_as("AH1Z", "Venom") : NULL;   // (a Huey from the spare's spawner - the mission flies its own)
+        if (!g_gVeh) { g_gVeh = coop_fresh_vehicle("AH1Z"); if (g_gVeh) g_hueyBad = 1; }
+        if (!g_gVeh) { bot_log("coopground: no transport could be spawned"); return NULL; }
+        vehicle_teleport_yaw(g_gVeh, mk, yaw);
+        g_gState = 1; g_gAt = now;
+        bot_log("coopground: a %s parked on the mark '%s' for the ground team - watching it 5 s", vehicle_name(g_gVeh), mark);
+        return NULL;
+    }
+    if (g_gState == 1) {
+        if (now - g_gAt < 5000) return NULL;
+        float *x = vehicle_xf(g_gVeh);
+        float dx = x ? x[12] - mk[0] : 1e9f, dz = x ? x[14] - mk[2] : 1e9f;
+        if (dx * dx + dz * dz > 3.0f * 3.0f) {   // (moved off: the mission flies it - never a human in there)
+            bot_log("coopground: the %s moved %.0f m off the mark - the mission is flying it; the AH-1Z spare instead", vehicle_name(g_gVeh), sqrtf(dx * dx + dz * dz));
+            if (strstr(vehicle_name(g_gVeh), "Venom")) g_hueyBad = 1;
+            g_gVeh = NULL; g_gState = 0;
+            return NULL;
+        }
+        g_gState = 2;
+        bot_log("coopground: the %s stays put on the mark - the ground team's transport", vehicle_name(g_gVeh));
+    }
+    return g_gVeh;
+}
+static int coop_ground_for(char *pl)   // 1 = seated (out again in a second); 0 = not yet (looked at again next tick)
+{
+    if (!coop_ground_vehicle()) return 0;
+    DWORD now = GetTickCount();
+    int seat = free_seat(g_gVeh);
+    if (seat < 0) return 0;
+    if (!((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(pl, g_gVeh, seat)) return 0;
+    for (int q = 0; q < 8; q++) if (!g_gExitPl[q]) { g_gExitPl[q] = pl; g_gExitAt[q] = now; break; }
+    bot_log("coopground: %s - on foot at the LZ (out of the %s)", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(g_gVeh));
+    return 1;
+}
+static void coop_ground_tick(void)   // let the ground team out, a second after they were seated
+{
+    DWORD now = GetTickCount();
+    for (int q = 0; q < 8; q++) {
+        char *pl = g_gExitPl[q];
+        if (!pl || now - g_gExitAt[q] < 1000) continue;
+        g_gExitPl[q] = NULL;
+        if (IsBadReadPtr(pl, 0x400) || !player_vehicle(pl)) continue;
+        typedef void (__attribute__((thiscall)) *ExitVehicle_t)(void *player, int a, int b);
+        ((ExitVehicle_t)ADDR_PLAYER_EXIT_VEHICLE)(pl, 0, 1);
+    }
+}
+
+// ---- coopvehicle (2026-10-28, Fire from the Sky): the mission seats its 2 players in a 2-seat AH-1Z; a 3rd / respawned human comes
+// out of coopspawn on foot (on the mission's invisible floor). For such a human (spawned by coopspawn, still on foot, < 2 min) whose
+// team-mate sits in a FULL vehicle: a vehicle spawner (VehicleSpawnEntity vt 025cb6d8) of the same vehicle (its data+0x50 blueprint
+// -> blueprint+0x20 = the vehicle's data) - one that does not spawn at mission start first (InitialAutoSpawn data+0x171 = 0: the
+// players' own spawner and the cut-scene prop both do) - is fired with no player (count reset), the new vehicle is teleported 25 m
+// to the right of the team-mate's (vehicle_teleport - the spawner's own spot is out of bounds) and the human takes its first free
+// seat. A 4th human gets the free seat in that extra vehicle instead of another one.
+#define ADDR_VEHICLE_SPAWN_VTABLE 0x025cb6d8
+static char *g_coopExtraVeh;
+static int g_coopExtraN;   // extra vehicles made this level: the k-th goes 25 m * (1 + k/2) to the right / left (alternating)
+static int coop_vehicle_for(char *pl)
+{
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    char *mateVeh = NULL;
+    for (unsigned k = 0; arr && k < cnt && k < 128 && !mateVeh; k++) {
+        char *o = arr[k], *v;
+        if (!o || o == pl || is_bot(o) || o[OFF_PLAYER_IS_AI] || player_team(o) != player_team(pl)) continue;
+        v = player_vehicle(o);
+        if (v && !IsBadReadPtr(v, 0x200) && *(unsigned *)v == ADDR_VEHICLE_VTABLE && free_seat(v) < 0) mateVeh = v;
+    }
+    if (!mateVeh) {
+        static DWORD said;
+        if (GetTickCount() - said > 5000) { said = GetTickCount(); bot_log("coopvehicle: %s waits - no team-mate in a full vehicle yet", pl + OFF_PLAYER_ONLINE_NAME); }
+        return 0;
+    }
+    // the extra vehicle from before, if it is still there and has room
+    if (g_coopExtraVeh && !IsBadReadPtr(g_coopExtraVeh, 0x200) && *(unsigned *)g_coopExtraVeh == ADDR_VEHICLE_VTABLE && free_seat(g_coopExtraVeh) >= 0) {
+        int seat = free_seat(g_coopExtraVeh);
+        if (((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(pl, g_coopExtraVeh, seat)) {
+            bot_log("coopvehicle: %s -> the extra %s, seat %d", pl + OFF_PLAYER_ONLINE_NAME, vehicle_name(g_coopExtraVeh), seat);
+            return 1;
+        }
+    }
+    if (g_coopExtraN >= g_coopMaxViper) return coop_ground_for(pl);   // (the helicopters are taken: on foot at the LZ)
+    void *mateData = *(void **)(mateVeh + 0x14);
+    char *sp[64], *pick = NULL;
+    int n = scan_objects(ADDR_VEHICLE_SPAWN_VTABLE, sp, 64);
+    for (int pass = 0; pass < 2 && !pick; pass++)
+        for (int k = 0; k < n && !pick; k++) {
+            char *d = !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+            char *bp = d && !IsBadReadPtr(d + 0x50, 4) ? *(char **)(d + 0x50) : NULL;
+            if (!bp || IsBadReadPtr(bp + 0x20, 4) || *(void **)(bp + 0x20) != mateData || IsBadReadPtr(d + 0x171, 1)) continue;
+            if (pass == 0 && d[0x171]) continue;   // (first: one that does not spawn at mission start)
+            pick = sp[k];
+        }
+    if (!pick) { bot_log("coopvehicle: no spawner for a %s", vehicle_name(mateVeh)); return 0; }
+    float to[3];
+    if (!vehicle_clear_spot(mateVeh, to)) return 0;   // (no spot: nothing spawned - a vehicle in the rocks blows up and fails the mission)
+    unsigned fn = *(unsigned *)(*(unsigned *)pick + 0x6c);
+    if (fn < 0x401000 || fn >= 0x02028000) return 0;
+    *(int *)(pick + OFF_SPAWNER_COUNT) = 0;
+    char *v = ((CseSpawn_t)fn)((void *)pick, NULL, 0xffffffffu, 0, 0);
+    if (!v || IsBadReadPtr(v, 0x200) || *(unsigned *)v != ADDR_VEHICLE_VTABLE) { bot_log("coopvehicle: spawner %p made nothing", pick); return 0; }
+    float *mx = vehicle_xf(mateVeh);
+    if (mx) {
+        if (!vehicle_teleport_like(v, mateVeh, to)) vehicle_teleport(v, to);
+    }
+    g_coopExtraVeh = v;
+    g_coopExtraN++;
+    int seat = free_seat(v) >= 0 ? 0 : -1;
+    char ok = seat >= 0 && ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(pl, v, 0);
+    bot_log("coopvehicle: %s's team-mate's %s is full - a new one from spawner %p, next to it at (%.0f, %.0f, %.0f): %s", pl + OFF_PLAYER_ONLINE_NAME,
+            vehicle_name(mateVeh), pick, mx ? to[0] : 0, mx ? to[1] : 0, mx ? to[2] : 0, ok ? "in, seat 0" : "NOT seated");
+    return ok;
+}
+// The round is over (server.onRoundOver since the last level load): no spawns, no vehicles - the end screen, then swaphold reloads.
+// A new level load (server.onLevelLoaded) starts afresh: the extra vehicle of the last one is gone (a reload of the same mission
+// keeps the level name - the stale pointer stopped coopvehicle, 17:15 test).
+static int coop_round_over(void)
+{
+    static long lastLoads = -1, roundsAtLoad;
+    long loads, rounds;
+    chat_level_events(&loads, &rounds);
+    if (loads != lastLoads) { lastLoads = loads; roundsAtLoad = rounds; g_coopExtraVeh = NULL; g_coopExtraN = 0; memset(g_coopNewPl, 0, sizeof g_coopNewPl);
+                              g_gVeh = NULL; g_gState = 0; g_hueyBad = 0; }
+    return rounds != roundsAtLoad;
+}
+static void coop_vehicle_tick(void)
+{
+    coop_ground_tick();
+    if (!g_coopVehicle || coop_round_over()) return;
+    DWORD now = GetTickCount();
+    for (int q = 0; q < 8; q++) {
+        char *pl = g_coopNewPl[q];
+        if (!pl) continue;
+        // (watched until seated / dead / 2 min: at mission start coopspawn is quicker than the mission seating the others - 17:07 test)
+        if (now - g_coopNewAt[q] > 120000 || IsBadReadPtr(pl, 0x400)) { g_coopNewPl[q] = NULL; continue; }
+        if (now - g_coopNewAt[q] < 500) continue;   // (the new soldier first)
+        if (!*(void **)(pl + OFF_PLAYER_SOLDIER) || player_vehicle(pl)) { g_coopNewPl[q] = NULL; continue; }
+        if (coop_vehicle_for(pl)) g_coopNewPl[q] = NULL;   // (else: no full team-mate vehicle yet - looked at again next tick)
+    }
+}
+
+// ---- coopboard on [LEVEL...] | off (2026-10-29, Fire from the Sky): the mission's AI troops spawn at the Hueys' start (on an
+// invisible platform, like the players' pad) but are never put in them (on the dedicated server they spawn a moment before the Hueys
+// exist, so their spawn-into-vehicle finds none) - they stand there all mission (the watcher: never seated, never moved) while the
+// Hueys fly their route empty. Every 2 s on the named levels: a mission AI (nameless, AI flag) alive, on foot and not moved since the
+// last look (2 s) is seated in the nearest EMPTY and MOVING vehicle (moved > 1 m since the last look - the flying Hueys; not the
+// frozen cut-scene prop or a helicopter parked on the pad) with a passenger seat free, at any distance (the Hueys spawn along their
+// route, 400 m+ from the troops - entering a seat works from anywhere). (Level-limited: other missions' idle AI and transports.)
+static void coop_board_tick(void)
+{
+    static DWORD last;
+    static char *seenPl[32]; static float seenPos[32][3];
+    if (!g_coopBoard || GetTickCount() - last < 2000) return;
+    last = GetTickCount();
+    if (g_coopBoardLevels[0]) {
+        const char *lv = current_level();
+        char key[40];
+        if (!lv) return;
+        snprintf(key, sizeof key, " %s ", lv);
+        if (!strstr(g_coopBoardLevels, key)) return;
+    }
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    char *ai[32]; int na = 0;
+    char *nowPl[32]; float nowPos[32][3]; int nn = 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128 && nn < 32; k++) {
+        char *o = arr[k];
+        if (!o || is_bot(o) || !o[OFF_PLAYER_IS_AI] || !*(void **)(o + OFF_PLAYER_SOLDIER) || player_vehicle(o)) continue;
+        float *p = human_pos(o);
+        if (!p) continue;
+        nowPl[nn] = o; memcpy(nowPos[nn], p, 12);
+        for (int q = 0; q < 32; q++)   // (standing still since the last look)
+            if (seenPl[q] == o && fabsf(seenPos[q][0] - p[0]) + fabsf(seenPos[q][1] - p[1]) + fabsf(seenPos[q][2] - p[2]) < 0.5f && na < 32) ai[na++] = o;
+        nn++;
+    }
+    memset(seenPl, 0, sizeof seenPl);
+    for (int q = 0; q < nn; q++) { seenPl[q] = nowPl[q]; memcpy(seenPos[q], nowPos[q], 12); }
+    if (!na) return;
+    char *vs[64];
+    int nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+    static char *vPrev[64]; static float vPrevPos[64][3]; static int nPrev;
+    int moving[64] = {0};
+    for (int k = 0; k < nv; k++) {
+        float *x = vehicle_xf(vs[k]);
+        if (!x) continue;
+        for (int q = 0; q < nPrev; q++)
+            if (vPrev[q] == vs[k] && fabsf(vPrevPos[q][0] - x[12]) + fabsf(vPrevPos[q][1] - x[13]) + fabsf(vPrevPos[q][2] - x[14]) > 1.0f) moving[k] = 1;
+    }
+    nPrev = 0;
+    for (int k = 0; k < nv && nPrev < 64; k++) { float *x = vehicle_xf(vs[k]); if (x) { vPrev[nPrev] = vs[k]; memcpy(vPrevPos[nPrev], x + 12, 12); nPrev++; } }
+    for (int i = 0; i < na; i++) {
+        float *p = human_pos(ai[i]);
+        char *best = NULL; float bd = 1e12f;
+        for (int k = 0; k < nv; k++) {
+            float *x = vehicle_xf(vs[k]);
+            char **b;
+            int n = x ? vehicle_seats(vs[k], &b) : 0, freeP = 0, used = 0;
+            for (int q = 0; q < n; q++) { if (*(void **)(b[q] + 0x4c)) used = 1; else if (q) freeP = 1; }
+            if (!freeP || used || !moving[k]) continue;   // (an empty, moving vehicle - the mission's transports in flight)
+            float d = (x[12] - p[0]) * (x[12] - p[0]) + (x[13] - p[1]) * (x[13] - p[1]) + (x[14] - p[2]) * (x[14] - p[2]);
+            if (d < bd) { bd = d; best = vs[k]; }
+        }
+        if (!best) continue;
+        char **b;
+        int n = vehicle_seats(best, &b), seat = -1;
+        for (int q = 1; q < n && seat < 0; q++) if (!*(void **)(b[q] + 0x4c)) seat = q;
+        if (seat < 0) continue;
+        char ok = ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(ai[i], best, seat);
+        bot_log("coopboard: mission AI %p (standing at %.0f, %.0f, %.0f) -> the %s %.0f m away, seat %d: %s", ai[i], p[0], p[1], p[2],
+                vehicle_name(best), sqrtf(bd), seat, ok ? "in" : "refused");
+    }
+}
+
+// ---- coopsquad <bots> <vehicle part> <mark> | off (2026-10-29, the user: "when the mission loads it should spawn the helicopter, the
+// bots get out, and their brains look for a way to the objective"). Once per level load, after the mission has started (its player
+// spawners used): the level's nav grid loaded (BotMod_nav_<level>.bin), bots added up to <bots> (team 1), spawned through the co-op
+// player spawners (coop_spawn_one - the safe path: a bot spawned through a mission AI spawner crashed the server when killed), a
+// vehicle from a spawner whose blueprint name contains <vehicle part> (Venom = the Huey) fired and put on the mark (coop_marks.txt,
+// vehicle_teleport_yaw), 3 s to settle, then the bots seated and let out in batches (all its seats), brains on -> they make for the
+// level's obj... objectives. Squad bots dead for 15 s: the same drop again (a new vehicle if the last one is gone).
+// A squad bot's soldier: through a FRIENDLY AI spawner (CharacterSpawnEntity, data team 1, PlayerType 1 - the mission's own AI soldiers,
+// arms and legs), the bot's AI flag on first. NOT the co-op player spawners: any soldier spawned there for a bot failed the mission at
+// once (AI flag or not - 12:49:53, 2026-10-29). A bot spawned here crashed the server when it died - that was the points record of a
+// deleted-and-re-added bot (stale +0x6c0): "pointguard on" (startup) fixes it. Where the spawner stands does not matter: the drop puts
+// them at the LZ.
+static void coop_bot_spawn(char *b)
+{
+    static char *sp[128]; static int n; static char lvl[64];
+    if (strcmp(lvl, g_level) || !n) { snprintf(lvl, sizeof lvl, "%s", g_level); n = scan_objects(0x025bbbc0, sp, 128); }
+    if (!b[OFF_PLAYER_IS_AI] != !g_coopBotAI) ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(b, g_coopBotAI);
+    if (player_team(b) != 1) ((AddToTeam_t)ADDR_ADD_TO_TEAM)(b, 1, 0, 1);
+    if (!g_coopBotType) {   // type 0: the co-op PLAYER spawners (CoopSoldier) - the only soldier BotMod can walk (11:14 they moved up in a
+        // clump; AISoldier / SoldierExtra ones stand frozen - the game's AI moves those). coopbotgod keeps their deaths from failing it.
+        // Their kit: the co-op spawners' customization (+0x188) is the helicopter crew's (a legless pilot model, the user 14:07) -
+        // swapped for the one spawn for the friendly AI spawner's (the mission's ground troops).
+        // (not the first friendly AI spawner's: Template_COOP_EOR is the end-of-round showroom soldier - knife only, 15:5x; the
+        //  mission's squad kits Template_Basic_Friendly_Soldier / _SMG carry guns - a bot gets one or the other in turn)
+        char *cust = NULL, *kits[4]; int nk = 0; static int turn;
+        for (int k = 0; k < n && nk < 4; k++) {
+            char *d = !IsBadReadPtr(sp[k], 0x90) && !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+            if (!d || IsBadReadPtr(d, 0x190) || *(int *)(d + 0x128) != 1 || *(int *)(d + 0x180) != 1) continue;
+            char *c = *(char **)(d + 0x188);
+            if (!strstr(asset_name(c), "Friendly_Soldier") || strstr(asset_name(c), "Extra")) continue;
+            int dup = 0;
+            for (int q = 0; q < nk; q++) if (kits[q] == c) dup = 1;
+            if (!dup) kits[nk++] = c;
+        }
+        if (nk) cust = kits[turn++ % nk];
+        if (!g_coopSpN) coop_find_spawners();
+        char *was[8]; DWORD prot[8]; int nsw = g_coopSpN < 8 ? g_coopSpN : 8;
+        for (int k = 0; k < nsw && cust; k++) {
+            char *d = *(char **)(g_coopSp[k] + 0x14);
+            was[k] = *(char **)(d + 0x188);
+            VirtualProtect(d + 0x188, 4, PAGE_READWRITE, &prot[k]);
+            *(char **)(d + 0x188) = cust;
+        }
+        int ok = coop_spawn_one(b, 1);
+        for (int k = 0; k < nsw && cust; k++) {
+            char *d = *(char **)(g_coopSp[k] + 0x14);
+            *(char **)(d + 0x188) = was[k];
+            VirtualProtect(d + 0x188, 4, prot[k], &prot[k]);
+        }
+        if (ok) bot_log("coopsquad: %s spawned through a co-op player spawner (CoopSoldier, kit %s)", b + OFF_PLAYER_ONLINE_NAME, cust ? asset_name(cust) : "the pilot's");
+        return;
+    }
+    for (int k = 0; k < n; k++) {
+        char *d = !IsBadReadPtr(sp[k], 0x90) && *(unsigned *)sp[k] == 0x025bbbc0 && !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+        if (!d || IsBadReadPtr(d, 0x190) || *(int *)(d + 0x128) != 1 || *(int *)(d + 0x180) != g_coopBotType) continue;   // (team 1, AI)
+        unsigned fn = *(unsigned *)(*(unsigned *)sp[k] + 0x6c);
+        int old = *(int *)(sp[k] + OFF_SPAWNER_COUNT);
+        char *bpWas = *(char **)(d + 0x50), *bpUse = NULL;
+        if (g_coopBotBp[0])
+            for (int q = 0; q < n && !bpUse; q++) {
+                char *dq = !IsBadReadPtr(sp[q] + 0x14, 4) ? *(char **)(sp[q] + 0x14) : NULL;
+                char *bq = dq && !IsBadReadPtr(dq + 0x50, 4) ? *(char **)(dq + 0x50) : NULL;
+                if (bq && strstr(asset_name(bq), g_coopBotBp)) bpUse = bq;
+            }
+        DWORD prot;
+        if (bpUse) { VirtualProtect(d + 0x50, 4, PAGE_READWRITE, &prot); *(char **)(d + 0x50) = bpUse; }
+        *(int *)(sp[k] + OFF_SPAWNER_COUNT) = 0;
+        ((CseSpawn_t)fn)((void *)sp[k], b, 0xffffffffu, 0, 0);
+        *(int *)(sp[k] + OFF_SPAWNER_COUNT) = old;   // (the mission's own count left as it was)
+        if (bpUse) { *(char **)(d + 0x50) = bpWas; VirtualProtect(d + 0x50, 4, prot, &prot); }
+        if (*(void **)(b + OFF_PLAYER_SOLDIER)) {
+            bot_log("coopsquad: %s spawned through friendly AI spawner %p (%s)", b + OFF_PLAYER_ONLINE_NAME, sp[k], bpUse ? asset_name(bpUse) : asset_name(*(void **)(d + 0x50)));
+            return;
+        }
+    }
+    n = 0;   // (none took it: look again next time)
+}
+// ---- Enemy waves per stage (2026-10-29, the user: "the waves that correlate with those capture points activate, and when those waves are
+// dead the next wave and capture point"). Every enemy soldier spawner of the mission (CharacterSpawnEntity, data team 2, PlayerType 1)
+// belongs to the objective nearest its WORLD spawn spot (vt+0x58 - prefab spawners' data positions are local); when a stage goes live
+// (and the mission is 35 s in) its spawners are fired with no player (count reset) - the mission's own soldiers and AI players. The
+// stage ends when its objective is ours, its wave is dead and no enemy is within 60 m (coop_capture_tick).
+// The mission's own way to bring a wave to life (2026-10-29): it never sends its wave spawners "Spawn" - it sends IssueOrder
+// (0xd2199312) to a ServerPatrolOrderEntity (vt 0x0263d5b8) whose "Soldiers" link is the spawner; with no delay that event runs
+// 0x01ba08a0(order, 0), which spawns the soldier (a frame later) with its route and combat readiness - it paces, fights, gets its
+// HUD marker. A soldier spawned by a direct spawner call stands inert. Which order spawns which spawner: BotMod\coop_orders.txt
+// (<level> <order> <spawner>, tools/ordermap.sh - the addresses are the same every boot).
+static char *g_ordSp[64], *g_ordOrd[64]; static int g_ordN; static char g_ordLevel[64];
+static char *coop_order_for(char *spawner)
+{
+    const char *cur = current_level();
+    if (!cur) return NULL;
+    if (strcmp(g_ordLevel, cur)) {
+        snprintf(g_ordLevel, sizeof g_ordLevel, "%s", cur);
+        g_ordN = 0;
+        char path[MAX_PATH + 64], l[256], lv[64]; unsigned o, sp;
+        botmod_file(path, sizeof path, "coop_orders.txt");
+        FILE *f = fopen(path, "r");
+        while (f && fgets(l, sizeof l, f) && g_ordN < 64)
+            if (l[0] != '#' && sscanf(l, "%63s %x %x", lv, &o, &sp) == 3 && !_stricmp(lv, cur)) { g_ordOrd[g_ordN] = (char *)o; g_ordSp[g_ordN] = (char *)sp; g_ordN++; }
+        if (f) fclose(f);
+        bot_log("coopwave: %d mission order(s) for %s from coop_orders.txt", g_ordN, cur);
+    }
+    for (int k = 0; k < g_ordN; k++)
+        if (g_ordSp[k] == spawner && !IsBadReadPtr(g_ordOrd[k], 0x20) && *(unsigned *)g_ordOrd[k] == 0x0263d5b8) return g_ordOrd[k];
+    return NULL;
+}
+static float g_wavePend[64][3]; static int g_wavePendN; static DWORD g_wavePendAt;
+static void coop_stage_wave_tick(void)
+{
+    if (g_wavePendN && g_stageWaveFor == g_coopStage) {   // the ordered soldiers (spawned a frame or more later): track them
+        char *pm = player_manager();
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+        for (int w = 0; w < g_wavePendN; w++)
+            for (unsigned q = 0; arr && q < cnt && q < 128; q++) {
+                char *o = arr[q], *so = o ? *(char **)(o + OFF_PLAYER_SOLDIER) : NULL;
+                if (!so || !o[OFF_PLAYER_IS_AI] || player_team(o) != 2 || is_bot(o)) continue;
+                float *p = (float *)(so + OFF_SOLDIER_SPAWN_POSITION), dx = p[0] - g_wavePend[w][0], dz = p[2] - g_wavePend[w][2];
+                if (dx * dx + dz * dz > 6.0f * 6.0f) continue;
+                int have = 0;
+                for (int e = 0; e < g_stageEnemyN; e++) if (g_stageEnemy[e] == o) have = 1;
+                if (have || g_stageEnemyN >= 64) continue;
+                g_stageEnemy[g_stageEnemyN++] = o;
+                g_wavePend[w][0] = 1e9f;   // (found)
+                break;
+            }
+        if (GetTickCount() - g_wavePendAt > 20000) {
+            bot_log("coopwave: stage %d - %d ordered enemy soldier(s) tracked", g_coopStage + 1, g_stageEnemyN);
+            g_wavePendN = 0;
+        }
+    }
+    if (g_coopWavesOff || g_stageWaveFor == g_coopStage || g_coopStage >= g_coopObjN) return;
+    g_stageWaveFor = g_coopStage;
+    g_wavePendN = 0; g_wavePendAt = GetTickCount();
+    int ordered = 0;
+    g_stageEnemyN = 0;
+    typedef char (__attribute__((thiscall)) *GetXf_t)(void *self, float *out);
+    char *sp[128];
+    int n = scan_objects(0x025bbbc0, sp, 128), fired = 0;
+    for (int k = 0; k < n; k++) {
+        char *d = !IsBadReadPtr(sp[k], 0x90) && !IsBadReadPtr(sp[k] + 0x14, 4) ? *(char **)(sp[k] + 0x14) : NULL;
+        if (!d || IsBadReadPtr(d, 0x190) || *(int *)(d + 0x128) != 2 || *(int *)(d + 0x180) != 1) continue;   // (team 2, AI)
+        __attribute__((aligned(16))) float x[16];
+        memset(x, 0, sizeof x);
+        ((GetXf_t)(*(unsigned **)sp[k])[0x58 / 4])(sp[k], x);
+        int best = -1; float bd = 1e30f;
+        for (int o = 0; o < g_coopObjN; o++) {
+            float dx = x[12] - g_coopObjPos[o][0], dz = x[14] - g_coopObjPos[o][2], dd = dx * dx + dz * dz;
+            if (dd < bd) { bd = dd; best = o; }
+        }
+        bot_log("coopwave: spawner %p (count %d) at (%.0f, %.0f, %.0f) -> objective %d%s", sp[k], *(int *)(sp[k] + OFF_SPAWNER_COUNT), x[12], x[13], x[14], best + 1,
+                best == g_coopStage ? " - fired" : "");
+        if (best != g_coopStage) continue;
+        char *ord = coop_order_for(sp[k]);
+        if (ord) {   // the mission's way: its order (see coop_order_for)
+            typedef void (__attribute__((thiscall)) *Issue_t)(void *self, int later);
+            if (!*(int *)(sp[k] + OFF_SPAWNER_COUNT)) {
+                ((Issue_t)0x01ba08a0)(ord, 0);
+                if (g_wavePendN < 64) { memcpy(g_wavePend[g_wavePendN], x + 12, 12); g_wavePendN++; }
+                ordered++; fired++;
+            }
+            continue;
+        }
+        unsigned fn = *(unsigned *)(*(unsigned *)sp[k] + 0x6c);
+        *(int *)(sp[k] + OFF_SPAWNER_COUNT) = 0;
+        char *so = ((CseSpawn_t)fn)((void *)sp[k], NULL, 0xffffffffu, 0, 0);
+        if (!so) continue;
+        fired++;
+        char *pm = player_manager();   // (the AI player that got it)
+        void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+        unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+        for (unsigned q = 0; arr && q < cnt && q < 128; q++)
+            if (arr[q] && *(char **)((char *)arr[q] + OFF_PLAYER_SOLDIER) == so && g_stageEnemyN < 64) g_stageEnemy[g_stageEnemyN++] = arr[q];
+    }
+    bot_log("coopwave: stage %d (%s) - %d enemy soldier(s) sent (%d by the mission's orders, %d tracked so far)", g_coopStage + 1, g_coopObjName[g_coopStage], fired, ordered, g_stageEnemyN);
+    if (fired) chat_say("[BotMod] Enemy contact at objective %d!", g_coopStage + 1);
+}
+
+static void coop_squad_tick(void)
+{
+    static int phase; static DWORD at; static char *veh; static long loadsSeen = -1; static DWORD deadSince;
+    static int triggered; static DWORD lookedAt, loadAt;
+    static char dropped[MAX_BOTS];   // (out of the vehicle this drop - a Huey flying on would make them look "not yet dropped")
+    if (!g_squadN) return;
+    {   // a fresh server: no bots = BotMod idles (no level setup, never "ready") - the squad's bots first, that wakes it up
+        static DWORD addedAt;
+        const char *cl = current_level();
+        if (cl && !strncmp(cl, "COOP_", 5) && !H->botCount && GetTickCount() - addedAt > 10000) {
+            addedAt = GetTickCount();
+            for (int k = 0; k < g_squadN; k++) cmd_add(NULL, 1, 0);
+            bot_log("coopsquad: %d bot(s) added on %s", g_squadN, cl);
+            return;
+        }
+    }
+    if (!g_levelReady || strncmp(g_level, "COOP_", 5)) return;
+    long loads, rounds;
+    chat_level_events(&loads, &rounds);
+    DWORD now = GetTickCount();
+    if (loads != loadsSeen) { loadsSeen = loads; phase = 0; veh = NULL; deadSince = 0; triggered = 0; loadAt = now; }   // (a new level load: start over)
+    if (phase == 0 && !triggered) {
+        // the trigger (the user: the Huey on the mark when the mission's drop-off happens, not at the start): one of the mission's own
+        // vehicles of that kind (its Hueys, flying their keyframed route) within 300 m of the mark - looked for every 3 s
+        float mp[3], my;
+        if (now - lookedAt < 3000) return;   // (every 3 s: a vehicle scan is a ~50 ms memory walk)
+        lookedAt = now;
+        if (!coop_mark_get(g_squadMark, mp, &my)) { bot_log("coopsquad: no mark '%s' for %s in coop_marks.txt", g_squadMark, g_level); g_squadN = 0; return; }
+        char *vs[64];
+        int nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+        for (int k = 0; k < nv && !triggered; k++) {
+            float *x = vehicle_xf(vs[k]);
+            if (!x || !strstr(vehicle_name(vs[k]), g_squadTrig[0] ? g_squadTrig : g_squadVeh)) continue;
+            float dx = x[12] - mp[0], dz = x[14] - mp[2];
+            if (dx * dx + dz * dz < 600.0f * 600.0f) {   // (600 m: the Hueys passed at 289 m once and missed 300 m the next time)
+                triggered = 1;
+                bot_log("coopsquad: the mission's %s is %.0f m from the mark '%s' - the drop-off", vehicle_name(vs[k]), sqrtf(dx * dx + dz * dz), g_squadMark);
+            }
+        }
+        if (g_squadGo) { g_squadGo = 0; triggered = 1; bot_log("coopsquad: go (by hand)"); }
+        if (!strcmp(g_squadTrig, "start") && now - loadAt > 35000) {   // (and every human has his soldier - or 2 min at most)
+            int waiting = 0;
+            char *pm = player_manager();
+            void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+            unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+            for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+                char *o = arr[k];
+                if (o && !is_bot(o) && !o[OFF_PLAYER_IS_AI] && o[OFF_PLAYER_ONLINE_NAME] && !*(void **)(o + OFF_PLAYER_SOLDIER)) waiting++;
+            }
+            if (!waiting || now - loadAt > 120000) { triggered = 1; bot_log("coopsquad: the drop (%lu s after the load, %d human(s) still without a soldier)", (now - loadAt) / 1000, waiting); }
+        }
+        // (35 s: the bots spawn through the same co-op player spawners the mission seats its players with - at the very start player 1
+        //  spawned into the void and only then into his seat, 12:45, 2026-10-29)
+        if (!triggered) return;
+    }
+    if (phase == 0) {
+        NavGrid *g = *nav_slot();
+        if (!g || strcmp(g->level, g_level)) {
+            char path[MAX_PATH + 64];
+            nav_file(path, sizeof path, g_level);
+            NavGrid *ng = nav_load(path);
+            if (ng) { nav_free(g); *nav_slot() = ng; *nav_building() = 0; bot_log("coopsquad: nav grid %s loaded (%dx%d)", g_level, ng->w, ng->h); }
+            else bot_log("coopsquad: no nav grid for %s (navbuild it) - the bots will stand", g_level);
+        }
+        int have = H->botCount;   // (every bot - BotMod's roster re-adds its bots after a level change; counting team 1 only doubled them)
+        for (int k = have; k < g_squadN; k++) cmd_add(NULL, 1, 0);
+        bot_log("coopsquad: %d bot(s) wanted, %d there - the drop starts", g_squadN, have);
+        phase = 1; at = now; g_squadDropAt = now;
+        return;
+    }
+    if (phase == 1) {   // soldiers for them (the co-op player spawners)
+        if (now - at < 3000) return;
+        static int markedFor = -1;
+        if (markedFor != (int)(at & 0x7fffffff)) {   // (once per drop: bots alive now stay where they are - a reinforcement drop
+            markedFor = (int)(at & 0x7fffffff);       //  pulled the whole squad back to the LZ, 2026-10-29)
+            for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) dropped[i] = *(void **)(H->bots[i] + OFF_PLAYER_SOLDIER) ? 1 : 0;
+        }
+        int missing = 0;
+        for (int i = 0; i < H->botCount; i++) {
+            char *b = H->bots[i];
+            if (player_team(b) != 1 && player_team(b) != 0) continue;
+            if (!*(void **)(b + OFF_PLAYER_SOLDIER)) {
+                // (own squads, as in MP - not the humans' squad: more than 4 people would not fit, the user 2026-10-29)
+                coop_bot_spawn(b);
+                if (!*(void **)(b + OFF_PLAYER_SOLDIER)) missing++;
+            }
+        }
+        if (missing && now - at < 20000) return;
+        phase = 2;
+    }
+    if (phase == 2 && !strcmp(g_squadVeh, "ground")) {   // the user: the grounded Huey on the LZ from the start, the bots out of it a
+        char *gv = coop_ground_vehicle();                  // seat-load at a time - none of the mission's own Hueys involved
+        if (!gv) return;
+        int seated = 0;
+        for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+            char *b = H->bots[i];
+            if (player_team(b) != 1 || !*(void **)(b + OFF_PLAYER_SOLDIER) || player_vehicle(b) || dropped[i]) continue;
+            int seat = free_seat(gv);
+            if (seat < 0) break;
+            if (!b[OFF_PLAYER_IS_AI]) ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(b, 1);
+            if (((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(b, gv, seat)) seated++;
+        }
+        veh = gv;
+        phase = 6; at = now;
+        return;
+    }
+    if (phase == 6) {   // (ground mode) out a second later - then the next seat-load, until everyone is at the LZ
+        if (now - at < 1000) return;
+        int out = 0, left = 0;
+        for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+            char *b = H->bots[i];
+            if (player_team(b) != 1 || !*(void **)(b + OFF_PLAYER_SOLDIER)) continue;
+            if (veh && player_vehicle(b) == veh) { g_pilotForceExit = 1; bot_exit_vehicle(i, 0); g_pilotForceExit = 0; dropped[i] = 1; out++; }
+            else if (!dropped[i] && !player_vehicle(b)) left++;
+        }
+        bot_log("coopsquad: %d bot(s) out of the parked %s at the LZ%s", out, veh ? vehicle_name(veh) : "?", left ? " - the next load" : "");
+        if (left && out) { phase = 2; return; }
+        for (int i = 0; i < H->botCount; i++) {
+            BotBrain *bb = bot_brain(i);
+            if (!bb->enabled) bb->enabled = 1;
+            bb->targetFlag = -1; bb->avoidFlag = -1; bb->avoidUntil = 0; bb->retryAt = 0; bb->enroute = bb->waiting = 0;
+        }
+        phase = 5; deadSince = 0;
+        return;
+    }
+    if (phase == 2) {   // aboard the mission's transports, in flight (the user: they get out AT the LZ, not before - the parachute jump
+        // out of a Huey still on its way made the mission fail, 2026-10-29): every free seat of every vehicle of the trigger kind
+        static char *tv[8]; static int ntv; static float lastPos[8][3]; static DWORD stillSince[8];
+        (void)lastPos; (void)stillSince;
+        char *vs[64];
+        int nv = scan_objects(ADDR_VEHICLE_VTABLE, vs, 64);
+        ntv = 0;
+        for (int k = 0; k < nv && ntv < 8; k++) if (vehicle_xf(vs[k]) && strstr(vehicle_name(vs[k]), g_squadTrig[0] ? g_squadTrig : g_squadVeh)) tv[ntv++] = vs[k];
+        if (!ntv) { bot_log("coopsquad: no '%s' in the air to ride in", g_squadTrig[0] ? g_squadTrig : g_squadVeh); phase = 5; return; }
+        int seated = 0;
+        for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+            char *b = H->bots[i];
+            if (player_team(b) != 1 || !*(void **)(b + OFF_PLAYER_SOLDIER) || player_vehicle(b) || dropped[i]) continue;
+            for (int k = 0; k < ntv; k++) {
+                int seat = free_seat(tv[k]);
+                if (seat < 0) continue;
+                if (!b[OFF_PLAYER_IS_AI]) ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(b, 1);   // (keyframed: AI only - see the FatalAssert note)
+                if (((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(b, tv[k], seat) && player_vehicle(b) == tv[k]) { seated++; break; }
+            }
+        }
+        bot_log("coopsquad: %d bot(s) aboard %d %s(s) - out when they land", seated, ntv, g_squadTrig[0] ? g_squadTrig : g_squadVeh);
+        veh = tv[0];
+        phase = 4; at = now;
+        return;
+    }
+    if (phase == 3 || phase == 4) {   // landed? out at the LZ; the ones without a seat ride in on the next landed one
+        static char *watched[8]; static float wPos[8][3]; static DWORD wStill[8];
+        if (now - at < 2000) return;
+        at = now;
+        static DWORD started;
+        if (!started) started = now;
+        int left = 0, aboard = 0;
+        for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+            char *b = H->bots[i];
+            if (player_team(b) != 1 || !*(void **)(b + OFF_PLAYER_SOLDIER) || dropped[i]) continue;
+            char *v = player_vehicle(b);
+            if (!v) { left++; continue; }
+            aboard++;
+            float *x = vehicle_xf(v);
+            if (!x) continue;
+            int w = -1, freeW = -1;
+            for (int q = 0; q < 8; q++) { if (watched[q] == v) w = q; else if (!watched[q] && freeW < 0) freeW = q; }
+            if (w < 0) { if (freeW < 0) continue; w = freeW; watched[w] = v; memcpy(wPos[w], x + 12, 12); wStill[w] = 0; continue; }
+            float d = fabsf(x[12] - wPos[w][0]) + fabsf(x[13] - wPos[w][1]) + fabsf(x[14] - wPos[w][2]);
+            memcpy(wPos[w], x + 12, 12);
+            if (d > 1.0f) { wStill[w] = 0; if (now - started < 180000) continue; }   // (still flying - 3 min at most)
+            else if (!wStill[w]) { wStill[w] = now; continue; }                       // (stopped: 2 s more to be sure)
+            g_pilotForceExit = 1; bot_exit_vehicle(i, 0); g_pilotForceExit = 0;
+            dropped[i] = 1;
+            bot_log("coopsquad: %s out of the landed %s at (%.0f, %.0f, %.0f)", b + OFF_PLAYER_ONLINE_NAME, vehicle_name(v), x[12], x[13], x[14]);
+        }
+        if (left) {   // (no seat on the way in: into a landed one now and straight out - they step out at the LZ too)
+            for (int q = 0; q < 8; q++) {
+                char *v = watched[q];
+                if (!v || !wStill[q] || IsBadReadPtr(v, 0x200) || *(unsigned *)v != ADDR_VEHICLE_VTABLE) continue;
+                for (int i = 0; i < H->botCount && i < MAX_BOTS; i++) {
+                    char *b = H->bots[i];
+                    if (player_team(b) != 1 || !*(void **)(b + OFF_PLAYER_SOLDIER) || dropped[i] || player_vehicle(b)) continue;
+                    int seat = free_seat(v);
+                    if (seat < 0) break;
+                    if (!b[OFF_PLAYER_IS_AI]) ((Player_SetAI_t)ADDR_PLAYER_SET_AI)(b, 1);
+                    ((EnterVehicle_t)ADDR_PLAYER_ENTER_VEHICLE)(b, v, seat);   // (out on the next look: the vehicle stands still)
+                }
+            }
+        }
+        if (!aboard && !left) {   // everyone out: brains on, objectives
+            for (int i = 0; i < H->botCount; i++) {
+                BotBrain *bb = bot_brain(i);
+                if (!bb->enabled) bb->enabled = 1;
+                bb->targetFlag = -1; bb->avoidFlag = -1; bb->avoidUntil = 0; bb->retryAt = 0; bb->enroute = bb->waiting = 0;
+            }
+            bot_log("coopsquad: the squad is on the ground - on to the objective");
+            memset(watched, 0, sizeof watched); started = 0;
+            phase = 5; deadSince = 0;
+        } else if (now - started > 240000) { memset(watched, 0, sizeof watched); started = 0; phase = 5; bot_log("coopsquad: gave up waiting for a landing"); }
+        return;
+    }
+    if (phase == 5) {   // reinforcements: squad bots dead for 15 s -> the drop again
+        if (coop_round_over()) return;
+        int dead = 0;
+        for (int i = 0; i < H->botCount; i++) if (player_team(H->bots[i]) == 1 && !*(void **)(H->bots[i] + OFF_PLAYER_SOLDIER)) dead++;
+        if (!dead) { deadSince = 0; return; }
+        if (!deadSince) { deadSince = now; return; }
+        if (now - deadSince < 15000) return;
+        bot_log("coopsquad: %d bot(s) dead for 15 s - another drop", dead);
+        deadSince = 0; phase = 1; at = now - 3000;
+    }
+}
+
+// The squad the OTHER humans on team 1 are in (the most of them), if it has room (4 a squad, AI members counted) - else 0.
+static int coop_human_squad(char *pl)
+{
+    int humans[33] = {0}, members[33] = {0}, best = 0;
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *o = arr[k];
+        int sq = o ? player_squad(o) : 0;
+        if (!o || player_team(o) != 1 || sq < 1 || sq > 32) continue;
+        if (o != pl) members[sq]++;
+        if (o != pl && !is_bot(o) && !o[OFF_PLAYER_IS_AI] && o[OFF_PLAYER_ONLINE_NAME]) humans[sq]++;
+    }
+    for (int sq = 1; sq <= 32; sq++) if (humans[sq] > humans[best]) best = sq;
+    return best && members[best] < 4 ? best : 0;
+}
+static void event_chain_tick(void)
+{
+    if (g_fireDiag && GetTickCount() - g_fdShownAt > 10000) fire_diag_show();
+    if (g_coopFadeDue && (int)(GetTickCount() - g_coopFadeDue) >= 0) {
+        g_coopFadeDue = 0;
+        bot_log("coopfade: a late player spawned - %s", g_coopFadeCmd);
+        char cmd[160]; snprintf(cmd, sizeof cmd, "%s", g_coopFadeCmd);
+        botmod_command(cmd);
+    }
+    for (int k = 0; k < g_chainN; k++) {
+        EvChain *c = &g_chain[k];
+        if (!c->armed || (int)(GetTickCount() - c->due) < 0) continue;
+        c->armed = 0;
+        if (!c->dstData || !c->bus) continue;
+        struct { unsigned vt, id; void *sender; } evt = {0x0246d404, c->dstEv, NULL};
+        typedef char (__attribute__((thiscall)) *Fire_t)(void *bus, void *data, void *ev);
+        char r = ((Fire_t)0x005dbf70)(c->bus, c->dstData, &evt);
+        bot_log("eventchain: %s event %08x fired - %s", c->dst, c->dstEv, r ? "a connection took it" : "no connection matched");
+    }
+}
+// ---- coopstall <seconds> [radius m] | off (2026-11-03, the user: "enemies keep staying in cover and not coming to where I can kill
+// them - if they haven't moved in on my location for 2 minutes, kill them and trigger the next part"). Progress = an enemy died or
+// one came within 25 m of a player. None for <seconds>: every live enemy within <radius> of a player dies (its own suicide call,
+// like killteam) - the mission counts them as kills and its next step runs. Enemies further ahead (later sections) are left alone.
+static void coop_stall_tick(void)
+{
+    static DWORD lastCheck, lastProgress; static int lastN = -1; static char lastLevel[64];
+    const char *cl = current_level();
+    DWORD now = GetTickCount();
+    if (!g_coopStallSec || !cl || strncmp(cl, "COOP_", 5)) { lastProgress = now; lastN = -1; return; }
+    if (strcmp(lastLevel, cl)) { snprintf(lastLevel, sizeof lastLevel, "%s", cl); lastProgress = now; lastN = -1; }
+    if (now - lastCheck < 1000) return;
+    lastCheck = now;
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    float hum[8][3]; int nh = 0, humTeam = 1;
+    char *en[96]; int ne = 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *p = arr[k];
+        if (!p) continue;
+        char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+        if (!so || IsBadReadPtr(so + 0x4c0, 4) || *(float *)(so + OFF_SOLDIER_HEALTH) <= 0) continue;
+        if (!p[OFF_PLAYER_IS_AI] && !is_bot(p)) {
+            if (nh < 8) { memcpy(hum[nh], so + OFF_SOLDIER_SPAWN_POSITION, 12); humTeam = player_team(p); nh++; }
+        }
+    }
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *p = arr[k];
+        if (!p || !p[OFF_PLAYER_IS_AI] || is_bot(p) || player_team(p) == humTeam) continue;
+        char *so = *(char **)(p + OFF_PLAYER_SOLDIER);
+        if (!so || IsBadReadPtr(so + 0x4c0, 4) || *(float *)(so + OFF_SOLDIER_HEALTH) <= 0) continue;
+        if (ne < 96) en[ne++] = so;
+    }
+    if (!nh || !ne) { lastProgress = now; lastN = ne; return; }
+    int progress = lastN >= 0 && ne < lastN;
+    for (int e = 0; e < ne && !progress; e++) {
+        float *ep = (float *)(en[e] + OFF_SOLDIER_SPAWN_POSITION);
+        for (int h = 0; h < nh; h++) {
+            float dx = ep[0] - hum[h][0], dz = ep[2] - hum[h][2];
+            if (dx * dx + dz * dz < 25.0f * 25.0f) { progress = 1; break; }
+        }
+    }
+    lastN = ne;
+    if (progress) { lastProgress = now; return; }
+    if (now - lastProgress < (DWORD)g_coopStallSec * 1000) return;
+    lastProgress = now;
+    int killed = 0;
+    for (int e = 0; e < ne; e++) {
+        float *ep = (float *)(en[e] + OFF_SOLDIER_SPAWN_POSITION);
+        int nearH = 0;
+        for (int h = 0; h < nh; h++) {
+            float dx = ep[0] - hum[h][0], dz = ep[2] - hum[h][2];
+            if (dx * dx + dz * dz < (float)g_coopStallRadius * g_coopStallRadius) nearH = 1;
+        }
+        if (!nearH) continue;
+        typedef void (__attribute__((thiscall)) *Kill_t)(void *soldier, int arg);
+        ((Kill_t)(*(void ***)en[e])[0x170 / 4])(en[e], 0);
+        killed++;
+    }
+    g_coopStallKills += killed;
+    lastN = -1;
+    bot_log("coopstall: no enemy died or came within 25 m of a player for %d s - %d enemy(ies) within %d m killed (%d further away left)",
+            g_coopStallSec, killed, g_coopStallRadius, ne - killed);
+}
+
+static void coop_tick(void)
+{
+    static DWORD last;
+    static char *deadPl[16]; static DWORD deadSince[16]; static int squadAsked[16];
+    if (!g_coopAuto) return;
+    DWORD now = GetTickCount();
+    if (now - last < 250) return;
+    last = now;
+    event_chain_tick();
+    if (g_coopRetarget) {   // (a new stage: every bot picks its objective again)
+        g_coopRetarget = 0;
+        for (int i = 0; i < H->botCount; i++) { BotBrain *b = bot_brain(i); b->targetFlag = -1; b->replanAt = 0; b->enroute = 0; b->waiting = 0; b->avoidFlag = -1; b->avoidUntil = 0; b->retryAt = 0; }
+    }
+    coop_vehicle_tick();
+    coop_board_tick();
+    coop_capture_tick();
+    const char *lv = current_level();
+    if (!lv || !strstr(lv, "COOP_")) { g_coopSpN = 0; g_coopLevel[0] = 0; return; }
+    if (strcmp(lv, g_coopLevel)) { snprintf(g_coopLevel, sizeof g_coopLevel, "%s", lv); g_coopSpN = 0; memset(deadPl, 0, sizeof deadPl); g_coopExtraVeh = NULL; g_coopExtraN = 0; }
+    if (!g_coopSpN && !coop_find_spawners()) return;
+    if (g_aiBpWanted && strcmp(g_bpLevel, lv)) { g_bpN = 0; ai_blueprint(1); snprintf(g_bpLevel, sizeof g_bpLevel, "%s", lv); }   // (a new level: its spawners)
+    if (coop_round_over()) return;   // (the end screen: nobody respawns until the next load)
+    static long humLoads = -1; static DWORD humLoadAt;
+    { long ld, rd; chat_level_events(&ld, &rd); if (ld != humLoads) { humLoads = ld; humLoadAt = now; } }
+    int humansWait = now - humLoadAt < 30000;   // (30 s after a level load the mission seats its players itself - coopspawn spawned
+                                                //  BrianAnim on foot first at 11:05, outside his helicopter: black-and-white screens)
+    {   // every human on team 1 - the mission's team (2026-10-28: a round restart with autobalance on put players on team 2: no
+        // objective markers, the mission's seats / triggers keyed to team 1)
+        char *pm0 = player_manager();
+        void **a0 = pm0 ? *(void ***)(pm0 + 0xac) : NULL;
+        unsigned c0 = pm0 ? *(unsigned *)(pm0 + 8) : 0;
+        for (unsigned k = 0; a0 && k < c0 && k < 128; k++) {
+            char *o = a0[k];
+            if (!o || o[OFF_PLAYER_IS_AI] || !o[OFF_PLAYER_ONLINE_NAME] || player_team(o) == 1) continue;   // (BotMod bots too: its MP
+            int was = player_team(o);                                                                    //  roster moved two to team 2)
+            char ok = ((AddToTeam_t)ADDR_ADD_TO_TEAM)(o, 1, 0, 1);
+            bot_log("coopspawn: %s was on team %d - back to team 1 (%s)", o + OFF_PLAYER_ONLINE_NAME, was, ok ? "ok" : "refused");
+        }
+    }
+    for (int k = 0; k < g_coopSpN; k++) {   // the mission has not used its spawners yet (waiting for players / its own start) - hands off
+        if (!coop_spawner_ok(g_coopSp[k])) { g_coopSpN = 0; return; }
+        if (*(int *)(g_coopSp[k] + OFF_SPAWNER_COUNT) == 0) return;
+    }
+    coop_squad_tick();   // (the mission has started: the squad drop)
+    if (!humansWait && now - humLoadAt > 35000 && (!g_squadN || (g_squadDropAt && now - g_squadDropAt > 10000))) coop_stage_wave_tick();   // (the stage's enemy wave - 35 s in, the players seated)
+    char *pm = player_manager();
+    void **arr = pm ? *(void ***)(pm + 0xac) : NULL;
+    unsigned cnt = pm ? *(unsigned *)(pm + 8) : 0;
+    for (unsigned k = 0; arr && k < cnt && k < 128; k++) {
+        char *o = arr[k];
+        if (!o || is_bot(o) || o[OFF_PLAYER_IS_AI] || !o[OFF_PLAYER_ONLINE_NAME] || humansWait) continue;
+        int slot = -1, free = -1;
+        for (int d = 0; d < 16; d++) { if (deadPl[d] == o) slot = d; else if (!deadPl[d] && free < 0) free = d; }
+        if (*(void **)(o + OFF_PLAYER_SOLDIER)) { if (slot >= 0) deadPl[slot] = NULL; continue; }
+        if (slot < 0) { if (free >= 0) { deadPl[free] = o; deadSince[free] = now; squadAsked[free] = 0; } continue; }
+        if (now - deadSince[slot] < (DWORD)g_coopDelayMs) continue;
+        {   // into the other humans' squad first (if it has room) - an RCON move while dead, the spawn on a later tick
+            int sq = coop_human_squad(o);
+            if (sq && player_squad(o) != sq && !squadAsked[slot]) {
+                squadAsked[slot] = 1;
+                chat_rcon("admin.movePlayer	%s	1	%d	false", o + OFF_PLAYER_ONLINE_NAME, sq);
+                bot_log("coopspawn: %s joins the players' squad %d", o + OFF_PLAYER_ONLINE_NAME, sq);
+                deadSince[slot] = now - (g_coopDelayMs > 500 ? g_coopDelayMs - 500 : 0);   // (spawn ~0.5 s later, once the move is through)
+                continue;
+            }
+        }
+        if (coop_spawn_one(o, 1)) deadPl[slot] = NULL;
+        else deadSince[slot] = now;   // (refused: try again after the delay)
+    }
+}
+
+// ---- BotMod\startup_<game port>.txt (2026-10-28, the co-op server): console commands run at every core start (server boot and
+// "reload" - the patches they set do not survive a reload), one per line, # = comment. E.g. server 5 (25304): animguard on,
+// levelswap MP_Subway COOP_007, coopspawn auto on.
+static void run_startup_file(void)
+{
+    char own[48], path[MAX_PATH + 64], line[512];
+    snprintf(own, sizeof own, "startup_%d.txt", H->gamePort);
+    botmod_file(path, sizeof path, own);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    bot_log("startup: %s", own);
+    while (fgets(line, sizeof line, f)) {
+        char *s = line, *e;
+        while (*s == ' ' || *s == '\t') s++;
+        e = s + strlen(s);
+        while (e > s && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        if (!*s || *s == '#') continue;
+        botmod_command(s);
+    }
+    fclose(f);
+}
+// swaphold on|off (2026-10-28, the co-op server): while a level swap is armed, a server that is not on the swap's TO level moves
+// on ("mapList.runNextRound") once that level has run 10 s - its first map (loaded before BotMod is up, ~12 s) and the map after
+// a finished mission. Its map list = another level first, then the FROM level: the swap must come from a DIFFERENT level - a
+// Metro -> Metro(=Exodus) reload crashed ("Couldn't look up data container Levels/COOP_007/COOP_007 (LevelData)"). Asked once per
+// level run (a load in progress still shows the old name), again after 2 min if nothing happened.
+static void swap_hold_tick(void)
+{
+    static char askedFor[64]; static DWORD since, askedAt;
+    const char *lv = current_level(), *to = strrchr(g_swapTo, '/');
+    if (!g_swapHold || !g_swapFrom[0] || !lv || !to) { since = 0; return; }
+    if (!_stricmp(lv, to + 1)) {   // on the co-op level
+        since = 0; askedFor[0] = 0;
+        // a mission over (pass or fail): the clients sit in the co-op lobby ("waiting for the host to select a mission" - no host on a
+        // dedicated server) while the server restarted the round by itself - a full load brings everyone back in. 10 s for the end
+        // screen, then mapList.runNextRound (-> the boot map -> swapped back here). TODO: a pass -> the next mission of a rotation.
+        static long seenRounds = -1; static DWORD overAt;
+        long loads, rounds;
+        chat_level_events(&loads, &rounds);
+        if (seenRounds < 0) seenRounds = rounds;
+        if (rounds != seenRounds) {
+            seenRounds = rounds; overAt = GetTickCount() ? GetTickCount() : 1;
+            bot_log("swaphold: mission over on %s - winning team %ld (%s); reloading it in 5 s", lv, chat_last_round_winner(),
+                    chat_last_round_winner() == 1 ? "passed?" : "failed");
+        }
+        if (overAt && GetTickCount() - overAt > 5000) {
+            overAt = 0;
+            bot_log("swaphold: mapList.runNextRound (back into %s)", to + 1);
+            chat_rcon("mapList.runNextRound");
+        }
+        return;
+    }
+    DWORD now = GetTickCount();
+    static long loadsSeen = -1; static DWORD loadedAt;
+    long loads, rounds;
+    chat_level_events(&loads, &rounds);
+    if (loads != loadsSeen) { loadsSeen = loads; loadedAt = now ? now : 1; }   // (RCON server.onLevelLoaded: this level is up)
+    if (!since) { since = now; return; }
+    // 1 s after the boot map reports loaded (was a flat 10 s - the user: switch faster); 10 s if no load event came
+    if (!(loadedAt && now - loadedAt > 1000 && loadedAt + 2000 >= since) && now - since < 10000) return;
+    if (!strcmp(askedFor, lv) && now - askedAt < 120000) return;
+    snprintf(askedFor, sizeof askedFor, "%s", lv); askedAt = now;
+    bot_log("swaphold: %s is running, not %s - mapList.runNextRound (the next entry is the swapped one)", lv, to + 1);
+    chat_rcon("mapList.runNextRound");
+}
+
 __declspec(dllexport) void botmod_tick(void)
 {
     if (!g_mainTid) g_mainTid = GetCurrentThreadId();
@@ -20233,12 +24446,39 @@ __declspec(dllexport) void botmod_tick(void)
     double tStart = perf_now(), tMark = tStart;
     perf_report();
     validate_bots();
+    terrainscan_tick();   // (also on an idle server)
+    combat_area_tick();   // (re-applies "combatarea off" after a core reload)
+    terrain_full_tick();
+    borders_tick();   // (zone survey + the out-of-bounds hook; also on an idle server)
+    death_areas_tick();
+    coop_tick();   // (co-op: 3rd+ humans / respawns - also on an idle server)
+    coop_stall_tick();
+    if (g_antWorld) ai_ants_refresh();
+    ai_host_tick();
+    ai_step_tick();   // (co-op mission AI: their character physics is never stepped - see ai_step_tick; also on an idle server)
+    swap_hold_tick();
     // No bots wanted and none here (e.g. a vehicles-only instance with botcount_<port>.txt = 0): idle - chat commands
     // (above) and the roster (so "!bots 8" still works) only; no nav building, surveys, level discovery or scans.
     if (*wanted_bots() == 0 && H->botCount == 0) {
         static unsigned idleLogged;
         if (!idleLogged) { idleLogged = 1; bot_log("idle: no bots wanted on this server - BotMod stays out of the way (\"!bots <n>\" to start)"); }
         roster_tick();
+        {   // (co-op on an idle server - aimove routes, 2026-11-03: the level's saved grid loaded once, a "navbuild" built)
+            const char *cl = current_level();
+            static char triedFor[64];
+            if (cl && !strncmp(cl, "COOP_", 5)) {
+                NavGrid *g = *nav_slot();
+                if (!*nav_building() && (!g || strcmp(g->level, cl)) && strcmp(triedFor, cl)) {
+                    snprintf(triedFor, sizeof triedFor, "%s", cl);
+                    char path[MAX_PATH + 64];
+                    nav_file(path, sizeof path, cl);
+                    NavGrid *ng = nav_load(path);
+                    if (ng) { nav_free(g); *nav_slot() = ng; bot_log("navload: %s %dx%d cells (co-op AI routes)", ng->level, ng->w, ng->h); }
+                    else bot_log("navload: no saved grid for %s (%s) - AI steer straight; \"navbuild\" makes one", cl, path);
+                }
+                if (*nav_building() || g_navNext) nav_tick();   // (a "navbuild" or a grid growing round an AI off the old one)
+            }
+        }
         return;
     }
     missile_tick();
@@ -20411,7 +24651,12 @@ __declspec(dllexport) void botmod_tick(void)
         if (g_fzSkips != fzSeen) { fzSeen = g_fzSkips; bot_log("friendzone: a death next to a spawn zone with no zone table - skipped (would have crashed the server; %u so far)", g_fzSkips); }
     }
     { double t = perf_now(); perf_add(PF_LEVEL, t - tMark); tMark = t; }
-    if (!level_ready()) { perf_add(PF_TOTAL, perf_now() - tStart); return; }   // level loading / changing: leave everything alone
+    if (!level_ready()) {   // level loading / changing: leave everything alone
+        // (co-op levels: BotMod's discovery finds no flags / HQ there and its job stalls - a nav grid asked for with "navbuild" is
+        //  built all the same, 2026-10-29)
+        { const char *cl = current_level(); if (cl && !strncmp(cl, "COOP_", 5) && *nav_building()) nav_tick(); }
+        perf_add(PF_TOTAL, perf_now() - tStart); return;
+    }
     // (each timed: one over 100 ms is named in the log - the "roster" bucket holds all of these; 190-230 ms spikes at 50 bots, 2026-10-25)
     #define SLOW_CALL(call) do { double t0_ = perf_now(); call; double ms_ = perf_now() - t0_; \
         if (ms_ > 100.0) bot_log("perf: %s took %.0f ms (%d bots)", #call, ms_, H->botCount); } while (0)
@@ -20423,7 +24668,7 @@ __declspec(dllexport) void botmod_tick(void)
     }
     if (g_levelReady) { SLOW_CALL(tickets_tick()); SLOW_CALL(swim_tick()); SLOW_CALL(tree_tick());
         if (!g_driveOff) { SLOW_CALL(drive_mask()); SLOW_CALL(drive_pave_tick()); SLOW_CALL(drive_strikes_tick()); SLOW_CALL(mat_survey_tick()); SLOW_CALL(width_survey_tick());
-                           SLOW_CALL(roadwatch_tick()); SLOW_CALL(squad_vehicle_tick()); SLOW_CALL(solo_vehicle_tick()); } }
+                           SLOW_CALL(roadwatch_tick()); SLOW_CALL(squad_vehicle_tick()); SLOW_CALL(solo_vehicle_tick()); SLOW_CALL(ctf_carrier_vehicle_tick()); } }
     if (g_readdCount) SLOW_CALL(readd_bots());
     // After a server start, bring up the 8-bot roster automatically (unless BotMod_autoroster.off exists).
     static int autoRosterDone;
@@ -20466,7 +24711,8 @@ __declspec(dllexport) void botmod_tick(void)
                 float *p = (float *)(s + OFF_SOLDIER_POSITION);
                 float dx = p[0] - lastPos[i][0], dz = p[2] - lastPos[i][2];
                 if (dx * dx + dz * dz > 9.0f || !lastMove[i]) { memcpy(lastPos[i], p, 12); lastMove[i] = H->frame; continue; }
-                if (H->frame - lastMove[i] > 45 * 30) {
+                if (H->frame - lastMove[i] > 45 * 30 && strncmp(g_level, "COOP_", 5)) {   // (not on co-op levels: killing a bot that had
+                    // been spawned through a mission AI spawner crashed server 5 - 2026-10-29; co-op bots come back by coopspawn / coopdrop)
                     bot_log("brain: %s has not moved for 45s at (%.1f, %.1f) - respawning it", H->bots[i] + OFF_PLAYER_ONLINE_NAME, p[0], p[2]);
                     kill_bot(H->bots[i]);
                     lastMove[i] = H->frame;
@@ -20876,6 +25122,8 @@ __declspec(dllexport) int botmod_init(BotModHost *host)
     load_bot_count();
     if (H->botCount) g_rosterAuto = 1;   // reload with bots already in: keep managing them
     bot_log("core: ready (%d bot(s) carried over, %d loadout(s))", H->botCount, loadout_lib()->count);
+    borders_config(NULL, NULL);   // (terrainfull from borders.txt before the first level loads)
+    run_startup_file();
     return 1;
 }
 
@@ -20897,6 +25145,25 @@ __declspec(dllexport) void botmod_shutdown(void)
         CloseHandle(g_compThread); g_compThread = NULL;
     }
     unpatch_all();
+    combat_area_unload();
+    terrain_full_unload();
+    borders_unload();
+    death_areas_unload();
+    level_swap_hook(0);
+    post_hook(0);
+    anim_guard(0);
+    if (g_pointGuard) point_guard(0);
+    if (g_inputGuard) input_guard(0);
+    if (g_serverAnim) server_anim(0);
+    if (g_aiFire) ai_fire(0);
+    if (g_fireDiag) fire_diag(0);
+    if (g_aiAim) ai_aim(0);
+    if (g_aiEye) ai_eye(0);
+    if (g_aiMove) ai_move(0);
+    if (g_aiPhys) ai_phys(0);
+    if (g_antWorld) ant_world(0);
+    fire_event_hook(0);
+    phys_shift("undo");
     exit_free_all();             // (the cached tables - the next core builds its own)
     nav_release_search_buffers();
     bot_log("core: shut down, all hooks removed");

@@ -21,6 +21,8 @@ void chat_game_mode(char *out, int n);
 // How many server.onLevelLoaded / server.onRoundOver events RCON has delivered so far (level reloads of the same map
 // are invisible otherwise).
 void chat_level_events(long *loads, long *roundsOver);
+// The winning team of the last server.onRoundOver (-1: none yet). Co-op: what a mission pass / fail reports.
+long chat_last_round_winner(void);
 // Switches the server to map `code` (e.g. MP_017) right away, via the rotation; announces it in chat.
 void chat_map(const char *code, const char *who);
 // Says this server's map rotation in chat (the !map list).

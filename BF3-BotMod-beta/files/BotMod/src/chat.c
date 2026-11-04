@@ -143,15 +143,24 @@ static int connect_rcon(void)
 }
 
 // An event from the server (sent unasked): acknowledge it, and queue "!" chat lines for the game thread.
-static volatile LONG g_levelLoads, g_roundsOver;
+static volatile LONG g_levelLoads, g_roundsOver, g_lastWinner = -1;
 void chat_level_events(long *loads, long *roundsOver) { *loads = g_levelLoads; *roundsOver = g_roundsOver; }
+long chat_last_round_winner(void) { return g_lastWinner; }
 
 static void handle_event(unsigned seq, int nw, char **w)
 {
     const char *ok[1] = {"OK"};
     send_words(seq | 0x40000000 | 0x80000000, 1, ok);
     if (nw >= 1 && !strcmp(w[0], "server.onLevelLoaded")) InterlockedIncrement(&g_levelLoads);
-    if (nw >= 1 && !strcmp(w[0], "server.onRoundOver")) InterlockedIncrement(&g_roundsOver);
+    if (nw >= 1 && !strncmp(w[0], "server.onRoundOver", 18)) {   // (2026-10-28 co-op: logged in full - what a mission pass / fail sends)
+        char all[256]; int k = 0;
+        for (int i = 0; i < nw && k < (int)sizeof all - 40; i++) k += snprintf(all + k, sizeof all - k, "%s%.32s", i ? " " : "", w[i]);
+        if (g_log) g_log("chat: event %s", all);
+        if (!strcmp(w[0], "server.onRoundOver")) {
+            if (nw >= 2) InterlockedExchange(&g_lastWinner, atol(w[1]));
+            InterlockedIncrement(&g_roundsOver);
+        }
+    }
     if (nw >= 3 && !strcmp(w[0], "player.onChat") && w[2][0] == '!' && strcmp(w[1], "Server")) {
         EnterCriticalSection(&g_lock);
         int next = (g_inHead + 1) % QUEUE_LEN;

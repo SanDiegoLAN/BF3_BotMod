@@ -71,6 +71,9 @@ static inline NavCtx *nav_ctx(void)
 #define g_lastError   (nav_ctx()->lastError)
 #define g_outLink     (nav_ctx()->outLink)
 void nav_set_long_legs(int on) { g_longLegs = on; }
+// A* expansion cap override (2026-10-29 co-op: one 550 m route to a single objective needs more than 60000; 0 = the defaults)
+static int s_maxExpanded;
+void nav_set_max_expanded(int n) { s_maxExpanded = n; }
 const unsigned char *nav_path_mask(void) { return g_pathMask; }
 int nav_long_legs(void) { return g_longLegs; }
 void nav_vehicle_state(float *half, float *hmul) { *half = g_vehHalf; *hmul = g_hMul; }
@@ -1821,7 +1824,7 @@ static int nav_find_path_once(const NavGrid *g, NavRayFn ray, float sx, float sy
     // vehicles: the full weight too (0.5 kept it exact for the cheap paved roads - and searched half of a big map: a
     // Damavand re-route froze the server 1.5 s); a road-hugging route a little less than perfect plans in a fraction
     float hw = ASTAR_HEURISTIC_WEIGHT * (g_pathMask ? g_hMul : g_roadMask ? 0.6f : 1.0f);
-    int maxExpanded = g_longLegs ? 120000 : 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every
+    int maxExpanded = s_maxExpanded > 0 ? s_maxExpanded : g_longLegs ? 120000 : 60000;   // (an unreachable goal used to search a whole big map - ~100 ms - and bots retried every
                                                      //  second; water legs: open sea round an island is wide - Kharg's ship to its north shore, 2026-10-22)
     gs[start] = 0; from[start] = -1; stamp[start] = curStamp;
     heap_push(heap, &hn, 0, start);

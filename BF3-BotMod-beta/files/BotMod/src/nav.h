@@ -119,6 +119,7 @@ int nav_rails_removed(void);
 int nav_stairs_added(void);
 // Long straight legs on the path mask (open water: a boat plots a direct line), instead of short road-hugging ones.
 void nav_set_long_legs(int on);
+void nav_set_max_expanded(int n);   // A* expansion cap (0 = defaults: 60000, long legs 120000)
 void nav_set_partial(int on);   // routes that cannot reach the goal: to the nearest point they can (boats)
 int nav_partial_used(void);
 int nav_partial_ok(void);
